@@ -507,22 +507,30 @@ while true; do
   # Force color alternation even when no new artwork is found
   if ! $ARTWORK_UPDATED && [ -n "$LAST_R" ] && [ -n "$LAST_G" ] && [ -n "$LAST_B" ]; then
     COLOR_INDEX=$((COLOR_INDEX % NUM_COLORS))
+    log_message "Checking color alternation - Current index: $COLOR_INDEX, Last index: $LAST_COLOR_INDEX"
     if [ "$COLOR_INDEX" != "$LAST_COLOR_INDEX" ]; then
+      log_message "Color indices differ, attempting alternation"
       # Find the active player
+      FOUND_ACTIVE_PLAYER=false
+      
+      # First check all players including Spotify
       for PLAYER in $PLAYERS; do
         STATUS=$(playerctl -p "$PLAYER" status 2>/dev/null)
         if [[ "$STATUS" == "Playing" ]]; then
-          # Skip excluded players
-          if [[ "$PLAYER" == *"spotify"* || "$PLAYER" == *"haruna"* || 
+          # Skip video players but allow Spotify for alternation
+          if [[ "$PLAYER" == *"haruna"* || 
                 "$PLAYER" == *"vlc"* || "$PLAYER" == *"mpv"* || 
                 "$PLAYER" == *"celluloid"* || "$PLAYER" == *"totem"* || 
                 "$PLAYER" == *"kdeconnect"* ]]; then
+            log_message "Skipping excluded player: $PLAYER for alternation"
             continue
           fi
           
           # Get current track info
           CURRENT_TITLE=$(playerctl -p "$PLAYER" metadata xesam:title 2>/dev/null)
           if [ -n "$CURRENT_TITLE" ]; then
+            log_message "Found eligible player for alternation: $PLAYER playing $CURRENT_TITLE"
+            FOUND_ACTIVE_PLAYER=true
             # Use the currently active colors but with the next index
             TRACK_TITLE="$CURRENT_TITLE (alternated)"
             
@@ -566,13 +574,68 @@ while true; do
               fi
             done
             break
+          else
+            log_message "Player $PLAYER has no track title"
           fi
+        else
+          log_message "Player $PLAYER is not playing (status: $STATUS)"
         fi
       done
+      
+      # If no eligible player found, use the last active track info for alternation
+      if ! $FOUND_ACTIVE_PLAYER && [ -n "$LAST_TRACK" ] && [ -n "$LAST_PLAYER" ]; then
+        log_message "No eligible active player found, using last track: $LAST_TRACK from $LAST_PLAYER"
+        
+        # Use the last track info
+        TRACK_TITLE="$LAST_TRACK (alternated)"
+        
+        # Apply the same color alternation logic
+        for ((i=0; i<$NUM_COLORS; i++)); do
+          if [ "$i" == "$COLOR_INDEX" ]; then
+            R=$((LAST_R + (i * 20 - 40)))
+            G=$((LAST_G + (i * 20 - 40)))
+            B=$((LAST_B + (i * 20 - 40)))
+            
+            # Ensure values are within range
+            [ $R -lt 0 ] && R=0
+            [ $G -lt 0 ] && G=0
+            [ $B -lt 0 ] && B=0
+            [ $R -gt 255 ] && R=255
+            [ $G -gt 255 ] && G=255
+            [ $B -gt 255 ] && B=255
+            
+            # Send the alternate color
+            TIMESTAMP=$(date "+%H:%M:%S")
+            echo "[$TIMESTAMP] Alternating colors for last track: $LAST_PLAYER - \"$TRACK_TITLE\""
+            echo "[$TIMESTAMP] Alternate color: R=$R G=$G B=$B (Color index: $COLOR_INDEX)"
+            
+            # Prepare payload
+            PAYLOAD="{\"rgb\": [$R, $G, $B]}"
+            
+            # Send to Home Assistant webhook
+            curl -s -X POST \
+              -H "Content-Type: application/json" \
+              -d "$PAYLOAD" \
+              "$WEBHOOK_URL"
+            
+            echo "[$TIMESTAMP] Sent alternated color to Home Assistant for last track"
+            LAST_COLOR_INDEX="$COLOR_INDEX"
+            COLOR_INDEX=$((COLOR_INDEX + 1))
+            log_message "Incremented COLOR_INDEX to $COLOR_INDEX for alternation with last track"
+            
+            # Mark as updated so we don't do this multiple times per cycle
+            ARTWORK_UPDATED=true
+            break
+          fi
+        done
+      elif ! $FOUND_ACTIVE_PLAYER; then
+        log_message "No eligible active player found and no last track info available"
+      fi
     fi
   fi
   
   # Check every POLL_INTERVAL seconds
+  log_message "Sleeping for $POLL_INTERVAL seconds"
   sleep $POLL_INTERVAL
 done
 
