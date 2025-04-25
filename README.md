@@ -17,28 +17,23 @@ git clone https://github.com/d3sox/mpris-rgb-homeassistant.git ~/.local/share/mp
 cd ~/.local/share/mpris-rgb-homeassistant
 ```
 
-2. Make the script executable:
-```bash
-chmod +x ~/.local/share/mpris-rgb-homeassistant/mpris_rgb_homeassistant.sh
-```
-
-3. Install the systemd service:
+2. Install the systemd service:
 ```bash
 mkdir -p ~/.config/systemd/user/
 cp ~/.local/share/mpris-rgb-homeassistant/mpris-rgb-homeassistant.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 ```
 
-4. Create a .env file in the installation directory:
+3. Create a .env file in the installation directory:
 ```bash
 cd ~/.local/share/mpris-rgb-homeassistant
 cat > .env << EOF
 WEBHOOK_URL="https://your-home-assistant:8123/api/webhook/unique_webhook_id"
-MUSIC_DIR="/path/to/your/music/library"
+MUSIC_DIR="/home/yourusername/Music/"
 EOF
 ```
 
-5. Enable and start the service:
+4. Enable and start the service:
 ```bash
 systemctl --user enable mpris-rgb-homeassistant.service
 systemctl --user start mpris-rgb-homeassistant.service
