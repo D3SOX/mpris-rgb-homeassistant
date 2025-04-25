@@ -28,7 +28,7 @@ systemctl --user daemon-reload
 ```bash
 cd ~/.local/share/mpris-rgb-homeassistant
 cat > .env << EOF
-WEBHOOK_URL="https://your-home-assistant:8123/api/webhook/unique_webhook_id"
+WEBHOOK_URL="http://your-home-assistant:8123/api/webhook/unique_webhook_id"
 MUSIC_DIR="/home/yourusername/Music/"
 EOF
 ```
