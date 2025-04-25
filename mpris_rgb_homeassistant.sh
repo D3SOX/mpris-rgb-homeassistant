@@ -1,5 +1,12 @@
 #!/bin/bash
 
+# Function to log with timestamp
+log_message() {
+  local MSG="$1"
+  local TIMESTAMP=$(date "+%H:%M:%S")
+  echo "[$TIMESTAMP] $MSG"
+}
+
 # Load environment variables from .env file
 if [ -f .env ]; then
   export $(grep -v '^#' .env | xargs)
@@ -313,13 +320,6 @@ process_artwork() {
     COLOR_INDEX=$((COLOR_INDEX + 1))
     log_message "Incremented COLOR_INDEX to $COLOR_INDEX" 
   fi
-}
-
-# Function to log with timestamp
-log_message() {
-  local MSG="$1"
-  local TIMESTAMP=$(date "+%H:%M:%S")
-  echo "[$TIMESTAMP] $MSG"
 }
 
 while true; do
