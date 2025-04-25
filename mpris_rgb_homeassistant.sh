@@ -35,6 +35,8 @@ LAST_PLAYER=""
 LAST_TRACK=""
 # First run flag
 FIRST_RUN=true
+# Last color index used
+LAST_COLOR_INDEX=-1
 
 mkdir -p "$TEMP_DIR"
 
@@ -285,8 +287,8 @@ process_artwork() {
   G=$(echo "$CURRENT_RGB" | cut -d "," -f 2)
   B=$(echo "$CURRENT_RGB" | cut -d "," -f 3)
   
-  # Only update if the color has actually changed
-  if [[ "$R" != "$LAST_R" || "$G" != "$LAST_G" || "$B" != "$LAST_B" ]]; then
+  # Update if the color index changed or artwork has changed
+  if [[ "$COLOR_INDEX" != "$LAST_COLOR_INDEX" || "$R" != "$LAST_R" || "$G" != "$LAST_G" || "$B" != "$LAST_B" ]]; then
     echo "[$TIMESTAMP] ACTIVE: $PLAYER_NAME - \"$TRACK_TITLE\""
     echo "[$TIMESTAMP] Color extracted: R=$R G=$G B=$B (Color index: $COLOR_INDEX)"
     
@@ -305,6 +307,7 @@ process_artwork() {
     LAST_R="$R"
     LAST_G="$G"
     LAST_B="$B"
+    LAST_COLOR_INDEX="$COLOR_INDEX"
     
     # Increment the color index for next time
     COLOR_INDEX=$((COLOR_INDEX + 1))
@@ -499,6 +502,74 @@ while true; do
         fi
       fi
     done
+  fi
+  
+  # Force color alternation even when no new artwork is found
+  if ! $ARTWORK_UPDATED && [ -n "$LAST_R" ] && [ -n "$LAST_G" ] && [ -n "$LAST_B" ]; then
+    COLOR_INDEX=$((COLOR_INDEX % NUM_COLORS))
+    if [ "$COLOR_INDEX" != "$LAST_COLOR_INDEX" ]; then
+      # Find the active player
+      for PLAYER in $PLAYERS; do
+        STATUS=$(playerctl -p "$PLAYER" status 2>/dev/null)
+        if [[ "$STATUS" == "Playing" ]]; then
+          # Skip excluded players
+          if [[ "$PLAYER" == *"spotify"* || "$PLAYER" == *"haruna"* || 
+                "$PLAYER" == *"vlc"* || "$PLAYER" == *"mpv"* || 
+                "$PLAYER" == *"celluloid"* || "$PLAYER" == *"totem"* || 
+                "$PLAYER" == *"kdeconnect"* ]]; then
+            continue
+          fi
+          
+          # Get current track info
+          CURRENT_TITLE=$(playerctl -p "$PLAYER" metadata xesam:title 2>/dev/null)
+          if [ -n "$CURRENT_TITLE" ]; then
+            # Use the currently active colors but with the next index
+            TRACK_TITLE="$CURRENT_TITLE (alternated)"
+            
+            # Get color for current index from the last extracted colors
+            for ((i=0; i<$NUM_COLORS; i++)); do
+              if [ "$i" == "$COLOR_INDEX" ]; then
+                R=$((LAST_R + (i * 20 - 40)))
+                G=$((LAST_G + (i * 20 - 40)))
+                B=$((LAST_B + (i * 20 - 40)))
+                
+                # Ensure values are within range
+                [ $R -lt 0 ] && R=0
+                [ $G -lt 0 ] && G=0
+                [ $B -lt 0 ] && B=0
+                [ $R -gt 255 ] && R=255
+                [ $G -gt 255 ] && G=255
+                [ $B -gt 255 ] && B=255
+                
+                # Send the alternate color
+                TIMESTAMP=$(date "+%H:%M:%S")
+                echo "[$TIMESTAMP] Alternating colors for: $PLAYER - \"$TRACK_TITLE\""
+                echo "[$TIMESTAMP] Alternate color: R=$R G=$G B=$B (Color index: $COLOR_INDEX)"
+                
+                # Prepare payload
+                PAYLOAD="{\"rgb\": [$R, $G, $B]}"
+                
+                # Send to Home Assistant webhook
+                curl -s -X POST \
+                  -H "Content-Type: application/json" \
+                  -d "$PAYLOAD" \
+                  "$WEBHOOK_URL"
+                
+                echo "[$TIMESTAMP] Sent alternated color to Home Assistant"
+                LAST_COLOR_INDEX="$COLOR_INDEX"
+                COLOR_INDEX=$((COLOR_INDEX + 1))
+                log_message "Incremented COLOR_INDEX to $COLOR_INDEX for alternation"
+                
+                # Mark as updated so we don't do this multiple times per cycle
+                ARTWORK_UPDATED=true
+                break
+              fi
+            done
+            break
+          fi
+        fi
+      done
+    fi
   fi
   
   # Check every POLL_INTERVAL seconds
