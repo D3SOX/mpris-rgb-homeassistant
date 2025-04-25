@@ -11,6 +11,9 @@ TEMP_DIR="/tmp/mpris_covers"
 NUM_COLORS=3  # Number of colors to extract
 COLOR_INDEX=0  # Track which color to use
 
+# For debugging
+log_message "Starting with NUM_COLORS=$NUM_COLORS and COLOR_INDEX=$COLOR_INDEX"
+
 # Check if required variables are set
 if [ -z "$WEBHOOK_URL" ]; then
   echo "Error: WEBHOOK_URL not defined in .env file"
@@ -302,10 +305,11 @@ process_artwork() {
     LAST_R="$R"
     LAST_G="$G"
     LAST_B="$B"
+    
+    # Increment the color index for next time
+    COLOR_INDEX=$((COLOR_INDEX + 1))
+    log_message "Incremented COLOR_INDEX to $COLOR_INDEX" 
   fi
-  
-  # Increment the color index for next time
-  COLOR_INDEX=$((COLOR_INDEX + 1))
 }
 
 # Function to log with timestamp
