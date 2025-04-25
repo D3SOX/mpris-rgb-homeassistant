@@ -1,0 +1,15 @@
+[Unit]
+Description=MPRIS RGB HomeAssistant Integration
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/scripts/mpris_rgb_homeassistant.sh
+WorkingDirectory=%h/scripts
+Restart=on-failure
+RestartSec=5
+Environment=DISPLAY=:0
+
+[Install]
+WantedBy=default.target
