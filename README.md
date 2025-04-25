@@ -35,8 +35,7 @@ EOF
 
 4. Enable and start the service:
 ```bash
-systemctl --user enable mpris-rgb-homeassistant.service
-systemctl --user start mpris-rgb-homeassistant.service
+systemctl --user enable --now mpris-rgb-homeassistant.service
 ```
 
 ## Verify Operation
