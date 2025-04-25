@@ -5,8 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%h/scripts/mpris_rgb_homeassistant.sh
-WorkingDirectory=%h/scripts
+ExecStart=%h/.local/share/mpris-rgb-homeassistant/mpris_rgb_homeassistant.sh
+WorkingDirectory=%h/.local/share/mpris-rgb-homeassistant
 Restart=on-failure
 RestartSec=5
 Environment=DISPLAY=:0

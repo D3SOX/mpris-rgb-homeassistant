@@ -10,20 +10,35 @@ A service that connects your media players to Home Assistant RGB devices. This u
 
 ## Installation
 
-1. Clone this repository or download the script files to your home directory
+1. Clone this repository to your local share directory:
+```bash
+mkdir -p ~/.local/share/mpris-rgb-homeassistant
+git clone https://github.com/YOUR_USERNAME/mpris-rgb-homeassistant.git ~/.local/share/mpris-rgb-homeassistant
+cd ~/.local/share/mpris-rgb-homeassistant
+```
 
 2. Make the script executable:
 ```bash
-chmod +x ~/scripts/mpris_rgb_homeassistant.sh
+chmod +x ~/.local/share/mpris-rgb-homeassistant/mpris_rgb_homeassistant.sh
 ```
 
 3. Install the systemd service:
 ```bash
-cp ~/scripts/mpris-rgb-homeassistant.service ~/.config/systemd/user/
+mkdir -p ~/.config/systemd/user/
+cp ~/.local/share/mpris-rgb-homeassistant/mpris-rgb-homeassistant.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 ```
 
-4. Enable and start the service:
+4. Create a .env file in the installation directory:
+```bash
+cd ~/.local/share/mpris-rgb-homeassistant
+cat > .env << EOF
+WEBHOOK_URL="https://your-home-assistant:8123/api/webhook/unique_webhook_id"
+MUSIC_DIR="/path/to/your/music/library"
+EOF
+```
+
+5. Enable and start the service:
 ```bash
 systemctl --user enable mpris-rgb-homeassistant.service
 systemctl --user start mpris-rgb-homeassistant.service
@@ -80,6 +95,49 @@ http://your-home-assistant:8123/api/webhook/unique_webhook_id
 
 The script will send RGB color data to this webhook, which Home Assistant will then apply to your light.
 
+## Remote API Access
+
+You can also trigger your RGB light control remotely through your Home Assistant instance. This allows external applications or services to control your RGB lights.
+
+### Setting Up Remote Access
+
+1. Make sure your Home Assistant instance is accessible remotely (e.g., through a domain like `https://home.example.org`)
+2. Set up proper authentication for your Home Assistant instance
+3. Use the following URL format to call your webhook:
+
+```
+https://home.example.org/api/webhook/unique_webhook_id
+```
+
+### Example API Calls
+
+To change your RGB light colors remotely, send a POST request to the webhook URL:
+
+```bash
+curl -X POST \
+  https://home.example.org/api/webhook/unique_webhook_id \
+  -H 'Content-Type: application/json' \
+  -d '{"rgb": [255, 0, 0]}'
+```
+
+Python example:
+```python
+import requests
+
+url = "https://home.example.org/api/webhook/unique_webhook_id"
+payload = {"rgb": [255, 0, 0]}  # Red color
+
+response = requests.post(url, json=payload)
+print(response.status_code)
+```
+
+### Authentication Notes
+
+- Webhook endpoints do not require authentication tokens
+- For security, consider enabling the `local_only: true` option in your webhook configuration if you don't need remote access
+- For further protection, use a long and complex webhook ID
+- Consider using HTTPS and proper network security measures
+
 ## Troubleshooting
 
 If you encounter issues:
@@ -87,7 +145,3 @@ If you encounter issues:
 2. Ensure your media player is compatible with MPRIS
 3. Verify your Home Assistant configuration is correct
 4. Check that the webhook ID in the script matches your Home Assistant automation
-
-## Development
-
-For developers looking to modify the script, the main functionality is in `mpris_rgb_homeassistant.sh`. ZZ
