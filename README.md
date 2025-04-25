@@ -139,3 +139,16 @@ If you encounter issues:
 2. Ensure your media player is compatible with MPRIS
 3. Verify your Home Assistant configuration is correct
 4. Check that the webhook ID in the script matches your Home Assistant automation
+
+## Spotify Local Files Support
+
+This service has special support for Spotify local files. When you play local files through Spotify:
+
+1. The service uses the track metadata to find matching MP3 files in your `MUSIC_DIR`
+2. It extracts album artwork directly from your local files
+3. The RGB colors are then generated from this artwork and sent to Home Assistant
+
+For this to work correctly:
+- Ensure your `MUSIC_DIR` in the `.env` file points to your music collection
+- Local files must be in MP3 format with embedded album artwork
+- File naming should reasonably match the track metadata from Spotify
