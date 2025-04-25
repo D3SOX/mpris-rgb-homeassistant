@@ -13,10 +13,13 @@ if [ -f .env ]; then
 fi
 
 # Configuration variables
-POLL_INTERVAL=2
+POLL_INTERVAL=2  # Main polling interval for checking media players
+ALTERNATION_DELAY=0.35  # Delay between color alternations
 TEMP_DIR="/tmp/mpris_covers"
-NUM_COLORS=3  # Number of colors to extract
+NUM_COLORS=3  # Number of colors to extract. Set to -1 to disable color alternation.
 COLOR_INDEX=0  # Track which color to use
+COLORS_CACHE=""  # Cache for extracted colors
+COLOR_SIMILARITY_THRESHOLD=50  # Threshold for color similarity detection
 
 # For debugging
 log_message "Starting with NUM_COLORS=$NUM_COLORS and COLOR_INDEX=$COLOR_INDEX"
@@ -44,6 +47,9 @@ LAST_TRACK=""
 FIRST_RUN=true
 # Last color index used
 LAST_COLOR_INDEX=-1
+
+# Background color alternation process ID
+COLOR_ALTERNATION_PID=""
 
 mkdir -p "$TEMP_DIR"
 
@@ -149,13 +155,117 @@ extract_artwork() {
   echo "$success"
 }
 
-# Function to process artwork and send colors to Home Assistant
+# Function to alternate colors in the background
+alternate_colors_background() {
+  local DELAY="$1"
+  local NEXT_INDEX=0
+  local COLORS_ARRAY=("$2" "$3" "$4")
+  local NUM_CACHED_COLORS="$5"
+  local WEBHOOK="$6"
+  local LAST_PLAYER_NAME="$7"
+  local LAST_TRACK_NAME="$8"
+  
+  log_message "Starting background color alternation with $NUM_CACHED_COLORS colors and delay $DELAY"
+  
+  # Validate color values before starting the loop
+  for ((i=0; i<$NUM_CACHED_COLORS; i++)); do
+    IFS=',' read -r CR CG CB <<< "${COLORS_ARRAY[$i]}"
+    
+    # Ensure values are in range 0-255
+    CR=$(echo "$CR" | grep -o '[0-9]*' | head -1)
+    CG=$(echo "$CG" | grep -o '[0-9]*' | head -1)
+    CB=$(echo "$CB" | grep -o '[0-9]*' | head -1)
+    
+    # Set defaults if invalid
+    [ -z "$CR" ] && CR=0
+    [ -z "$CG" ] && CG=0
+    [ -z "$CB" ] && CB=0
+    
+    # Ensure values are in valid range
+    CR=$(( CR > 255 ? 255 : (CR < 0 ? 0 : CR) ))
+    CG=$(( CG > 255 ? 255 : (CG < 0 ? 0 : CG) ))
+    CB=$(( CB > 255 ? 255 : (CB < 0 ? 0 : CB) ))
+    
+    # Update the array
+    COLORS_ARRAY[$i]="$CR,$CG,$CB"
+    
+    # Remove redundant color logging - this is already done in the main process
+  done
+  
+  # Continuously alternate colors at the specified delay
+  while true; do
+    # Exit if we should stop alternating (NUM_COLORS <= 0)
+    if [ -f "/tmp/mpris_rgb_stop_alternation" ]; then
+      log_message "Stopping background color alternation"
+      rm -f "/tmp/mpris_rgb_stop_alternation"
+      exit 0
+    fi
+    
+    # Calculate next index
+    NEXT_INDEX=$((NEXT_INDEX % NUM_CACHED_COLORS))
+    
+    # Get color for current index
+    IFS=',' read -r R G B <<< "${COLORS_ARRAY[$NEXT_INDEX]}"
+    
+    # Ensure RGB values are valid integers in range 0-255
+    R=$(echo "$R" | grep -o '[0-9]*' | head -1)
+    G=$(echo "$G" | grep -o '[0-9]*' | head -1)
+    B=$(echo "$B" | grep -o '[0-9]*' | head -1)
+    
+    # Set defaults if values are invalid
+    [ -z "$R" ] && R=0
+    [ -z "$G" ] && G=0
+    [ -z "$B" ] && B=0
+    
+    # Ensure values are in valid range
+    R=$(( R > 255 ? 255 : R ))
+    G=$(( G > 255 ? 255 : G ))
+    B=$(( B > 255 ? 255 : B ))
+    
+    # No logging here - just send to Home Assistant
+    
+    # Prepare payload
+    PAYLOAD="{\"rgb\": [$R, $G, $B]}"
+    
+    # Send to Home Assistant webhook
+    curl -s -X POST \
+      -H "Content-Type: application/json" \
+      -d "$PAYLOAD" \
+      "$WEBHOOK" >/dev/null 2>&1
+    
+    # Increment index for next time
+    NEXT_INDEX=$((NEXT_INDEX + 1))
+    
+    # Sleep for the specified delay
+    sleep "$DELAY"
+  done
+}
+
+# Function to stop background color alternation
+stop_background_alternation() {
+  if [ -n "$COLOR_ALTERNATION_PID" ]; then
+    log_message "Stopping previous color alternation process (PID: $COLOR_ALTERNATION_PID)"
+    touch "/tmp/mpris_rgb_stop_alternation"
+    # Give it a moment to exit cleanly
+    sleep 0.5
+    # Force kill if still running
+    if kill -0 $COLOR_ALTERNATION_PID 2>/dev/null; then
+      kill $COLOR_ALTERNATION_PID 2>/dev/null
+    fi
+    COLOR_ALTERNATION_PID=""
+  fi
+}
+
+# Modified process_artwork function to extract and cache all colors at once
 process_artwork() {
   local ART_SOURCE="$1"
   local PLAYER_NAME="$2"
   local TRACK_TITLE="$3"
   local COVER_PATH="$TEMP_DIR/current_cover.jpg"
   local TIMESTAMP=$(date "+%H:%M:%S")
+  
+  # First, stop any existing color alternation
+  stop_background_alternation
   
   # Download/copy art to temp location
   if [[ "$ART_SOURCE" == file://* ]]; then
@@ -178,40 +288,103 @@ process_artwork() {
   magick "$TEMP_PROCESS_DIR/vibrant.jpg" -colors 16 -unique-colors "$TEMP_PROCESS_DIR/colors.gif"
   
   # Split the image into tiles and find the most colorful tiles
-  magick "$TEMP_PROCESS_DIR/vibrant.jpg" -crop 4x4@ +repage +adjoin "$TEMP_PROCESS_DIR/tile_%d.jpg"
+  # Using a finer grid (6x6) to capture more color variety
+  magick "$TEMP_PROCESS_DIR/vibrant.jpg" -crop 6x6@ +repage +adjoin "$TEMP_PROCESS_DIR/tile_%d.jpg"
   
   # Extract multiple colors from different tiles
   declare -a COLORS_ARRAY
   declare -a SATURATION_ARRAY
+  declare -a HUE_ARRAY
   
   # Initialize arrays
-  for ((i=0; i<$NUM_COLORS; i++)); do
+  for ((i=0; i<16; i++)); do
     COLORS_ARRAY[$i]="0,0,0"
     SATURATION_ARRAY[$i]=0
+    HUE_ARRAY[$i]=0
   done
   
-  # Analyze each tile for saturation and color
+  # Analyze each tile for saturation, hue, and color
   for TILE in "$TEMP_PROCESS_DIR"/tile_*.jpg; do
-    # Calculate average saturation (using HSL colorspace where saturation is the second channel)
-    SATURATION=$(magick "$TILE" -colorspace HSL -format "%[fx:mean.g*100]" info:)
+    # Extract HSL values (Hue, Saturation, Lightness)
+    HSL=$(magick "$TILE" -colorspace HSL -format "%[fx:mean.r*360],%[fx:mean.g*100],%[fx:mean.b*100]" info:)
+    HUE=$(echo "$HSL" | cut -d "," -f 1)
+    SATURATION=$(echo "$HSL" | cut -d "," -f 2)
+    LIGHTNESS=$(echo "$HSL" | cut -d "," -f 3)
     
-    # Extract color from tile
-    TILE_RGB=$(magick "$TILE" -resize 1x1\! \
-      -format "%[fx:int(255*r)],%[fx:int(255*g)],%[fx:int(255*b)]" info:)
+    # Skip very dark or very light tiles
+    if (( $(echo "$LIGHTNESS < 15 || $LIGHTNESS > 85" | bc -l 2>/dev/null) )); then
+      continue
+    fi
     
-    # Check if this color is more saturated than our current colors
-    for ((i=0; i<$NUM_COLORS; i++)); do
-      if (( $(echo "$SATURATION > ${SATURATION_ARRAY[$i]}" | bc -l 2>/dev/null) )); then
-        # Shift the rest of the array to make room
-        for ((j=$NUM_COLORS-1; j>$i; j--)); do
-          SATURATION_ARRAY[$j]=${SATURATION_ARRAY[$j-1]}
-          COLORS_ARRAY[$j]=${COLORS_ARRAY[$j-1]}
-        done
-        
-        # Insert the new color
-        SATURATION_ARRAY[$i]=$SATURATION
-        COLORS_ARRAY[$i]=$TILE_RGB
+    # Extract color from tile - make sure it's in 0-255 range
+    TILE_RGB=$(magick "$TILE" -resize 1x1\! -format "%[fx:int(255*r)],%[fx:int(255*g)],%[fx:int(255*b)]" info:)
+    
+    # Calculate color score (combination of saturation and uniqueness)
+    COLOR_SCORE=$SATURATION
+    
+    # Check if this color is unique enough compared to colors we already have
+    IS_UNIQUE=true
+    for ((j=0; j<16; j++)); do
+      if [[ "${COLORS_ARRAY[$j]}" == "0,0,0" ]]; then
+        continue  # Skip uninitialized positions
+      fi
+      
+      # Calculate hue difference with existing colors
+      HUE_DIFF=$(echo "scale=2; a=$HUE; b=${HUE_ARRAY[$j]}; if(a>b) a-b else b-a" | bc -l 2>/dev/null)
+      # If hue difference is greater than 180, calculate the shorter path around the color wheel
+      if (( $(echo "$HUE_DIFF > 180" | bc -l 2>/dev/null) )); then
+        HUE_DIFF=$(echo "scale=2; 360-$HUE_DIFF" | bc -l 2>/dev/null)
+      fi
+      
+      # If hues are too similar, mark as not unique
+      if (( $(echo "$HUE_DIFF < 30" | bc -l 2>/dev/null) )); then
+        IS_UNIQUE=false
         break
+      fi
+    done
+    
+    # Add color to our collection if it's unique enough or initial positions
+    if $IS_UNIQUE || [[ "${COLORS_ARRAY[0]}" == "0,0,0" ]]; then
+      # Find an open slot or lowest saturation slot
+      TARGET_SLOT=-1
+      MIN_SATURATION=101  # Above max possible saturation
+      
+      for ((j=0; j<16; j++)); do
+        if [[ "${COLORS_ARRAY[$j]}" == "0,0,0" ]]; then
+          TARGET_SLOT=$j
+          break
+        elif (( $(echo "${SATURATION_ARRAY[$j]} < $MIN_SATURATION" | bc -l 2>/dev/null) )); then
+          MIN_SATURATION=${SATURATION_ARRAY[$j]}
+          TARGET_SLOT=$j
+        fi
+      done
+      
+      if [[ $TARGET_SLOT -ne -1 ]] && (( $(echo "$SATURATION > $MIN_SATURATION" | bc -l 2>/dev/null) )); then
+        COLORS_ARRAY[$TARGET_SLOT]=$TILE_RGB
+        SATURATION_ARRAY[$TARGET_SLOT]=$SATURATION
+        HUE_ARRAY[$TARGET_SLOT]=$HUE
+      fi
+    fi
+  done
+  
+  # Sort colors by saturation (highest first)
+  for ((i=0; i<15; i++)); do
+    for ((j=i+1; j<16; j++)); do
+      if (( $(echo "${SATURATION_ARRAY[$i]} < ${SATURATION_ARRAY[$j]}" | bc -l 2>/dev/null) )); then
+        # Swap colors
+        TEMP_COLOR=${COLORS_ARRAY[$i]}
+        COLORS_ARRAY[$i]=${COLORS_ARRAY[$j]}
+        COLORS_ARRAY[$j]=$TEMP_COLOR
+        
+        # Swap saturation
+        TEMP_SAT=${SATURATION_ARRAY[$i]}
+        SATURATION_ARRAY[$i]=${SATURATION_ARRAY[$j]}
+        SATURATION_ARRAY[$j]=$TEMP_SAT
+        
+        # Swap hue
+        TEMP_HUE=${HUE_ARRAY[$i]}
+        HUE_ARRAY[$i]=${HUE_ARRAY[$j]}
+        HUE_ARRAY[$j]=$TEMP_HUE
       fi
     done
   done
@@ -223,102 +396,297 @@ process_artwork() {
     for ((i=0; i<$NUM_COLORS; i++)); do
       COLORS_ARRAY[$i]=$(magick "$TEMP_PROCESS_DIR/colors.gif" -format "%[pixel:p{$i,0}]" info: | 
         sed 's/srgb(//' | sed 's/)//' | tr ',' ' ' | 
-        awk '{printf("%d,%d,%d", $1*255, $2*255, $3*255)}')
+        awk '{printf("%d,%d,%d", int($1*255), int($2*255), int($3*255))}')
     done
   fi
   
-  # Ensure we have valid colors
+  # Check color variety
+  local ALL_SIMILAR=true
+  local SIMILARITY_COUNT=0
+  
+  # Create final colors array with exactly the required number of colors
+  declare -a FINAL_COLORS
   for ((i=0; i<$NUM_COLORS; i++)); do
-    # Parse RGB values
-    R=$(echo "${COLORS_ARRAY[$i]}" | cut -d "," -f 1)
-    G=$(echo "${COLORS_ARRAY[$i]}" | cut -d "," -f 2)
-    B=$(echo "${COLORS_ARRAY[$i]}" | cut -d "," -f 3)
-    
-    # Ensure values are integers and not empty
-    R=$(echo "$R" | sed 's/[^0-9]//g')
-    G=$(echo "$G" | sed 's/[^0-9]//g')
-    B=$(echo "$B" | sed 's/[^0-9]//g')
-    
-    # Validate all values
-    if [[ -z "$R" || -z "$G" || -z "$B" ]]; then
-      # If extraction totally failed, use a vibrant default
-      R=128
-      G=$((50 + 50*i))
-      B=128
-    fi
-    
-    # If all colors are too similar (grayscale), boost the dominant channel
-    RANGE=$(($(echo "$R $G $B" | tr ' ' '\n' | sort -nr | head -1) - $(echo "$R $G $B" | tr ' ' '\n' | sort -n | head -1)))
-    if [ $RANGE -lt 30 ]; then
-      # Find the highest channel and boost it
-      if [ $R -ge $G ] && [ $R -ge $B ]; then
-        # Red is highest, boost it
-        R=$((R + 50))
-        if [ $R -gt 255 ]; then R=255; fi
-        G=$((G - 20))
-        if [ $G -lt 0 ]; then G=0; fi
-        B=$((B - 20))
-        if [ $B -lt 0 ]; then B=0; fi
-      elif [ $G -ge $R ] && [ $G -ge $B ]; then
-        # Green is highest, boost it
-        G=$((G + 50))
-        if [ $G -gt 255 ]; then G=255; fi
-        R=$((R - 20))
-        if [ $R -lt 0 ]; then R=0; fi
-        B=$((B - 20))
-        if [ $B -lt 0 ]; then B=0; fi
+    if [ $i -lt ${#COLORS_ARRAY[@]} ] && [ "${COLORS_ARRAY[$i]}" != "0,0,0" ]; then
+      FINAL_COLORS[$i]=${COLORS_ARRAY[$i]}
+    else
+      # If we don't have enough valid colors, create complementary ones
+      if [ $i -gt 0 ]; then
+        # Get a previous valid color
+        local BASE_COLOR=${FINAL_COLORS[0]}
+        
+        # Create complementary color by offsetting the hue
+        IFS=',' read -r R G B <<< "$BASE_COLOR"
+        
+        # Convert RGB to HSL, shift the hue, and convert back to RGB
+        # Here we're using simple hue shifting based on position
+        # Hue offsets: 120° and 240° for complementary colors in a triad
+        local HUE_OFFSET=$((120 * i % 360))
+        
+        # Use ImageMagick to handle the conversion
+        TEMP_COLOR_FILE="$TEMP_PROCESS_DIR/temp_color_$i.png"
+        echo "rgb($R,$G,$B)" | magick -size 1x1 xc:- -colorspace HSL \
+          -modulate 100,100,$((100 + HUE_OFFSET)) -colorspace sRGB \
+          -format "%[fx:int(255*r)],%[fx:int(255*g)],%[fx:int(255*b)]" info: > "$TEMP_COLOR_FILE" 2>/dev/null
+        
+        # Ensure we get 0-255 range for RGB values
+        NEW_COLOR=$(cat "$TEMP_COLOR_FILE" | sed -E 's/[^0-9,]//g')
+        
+        # Check if values are valid
+        IFS=',' read -r NR NG NB <<< "$NEW_COLOR"
+        if [[ -z "$NR" || -z "$NG" || -z "$NB" ]] || \
+           [[ "$NR" -gt 255 || "$NG" -gt 255 || "$NB" -gt 255 ]]; then
+          # Use fallback color if values are invalid
+          case $i in
+            1) NEW_COLOR="0,255,0" ;;    # Green
+            2) NEW_COLOR="0,0,255" ;;    # Blue
+            *) NEW_COLOR="255,255,0" ;;  # Yellow
+          esac
+        fi
+        
+        FINAL_COLORS[$i]=$NEW_COLOR
       else
-        # Blue is highest, boost it
-        B=$((B + 50))
-        if [ $B -gt 255 ]; then B=255; fi
-        R=$((R - 20))
-        if [ $R -lt 0 ]; then R=0; fi
-        G=$((G - 20))
-        if [ $G -lt 0 ]; then G=0; fi
+        # Default vibrant color if we have no valid colors at all
+        case $i in
+          0) FINAL_COLORS[$i]="255,0,0" ;;    # Red
+          1) FINAL_COLORS[$i]="0,255,0" ;;    # Green
+          2) FINAL_COLORS[$i]="0,0,255" ;;    # Blue
+          *) FINAL_COLORS[$i]="255,255,0" ;;  # Yellow
+        esac
       fi
     fi
+  done
+  
+  # Now check if the selected colors are too similar
+  for ((i=0; i<$NUM_COLORS-1; i++)); do
+    for ((j=i+1; j<$NUM_COLORS; j++)); do
+      IFS=',' read -r R1 G1 B1 <<< "${FINAL_COLORS[$i]}"
+      IFS=',' read -r R2 G2 B2 <<< "${FINAL_COLORS[$j]}"
+      
+      # Validate RGB values (ensure they're in 0-255 range)
+      R1=$(echo "$R1" | grep -o '[0-9]*' | head -1)
+      G1=$(echo "$G1" | grep -o '[0-9]*' | head -1)
+      B1=$(echo "$B1" | grep -o '[0-9]*' | head -1)
+      R2=$(echo "$R2" | grep -o '[0-9]*' | head -1)
+      G2=$(echo "$G2" | grep -o '[0-9]*' | head -1)
+      B2=$(echo "$B2" | grep -o '[0-9]*' | head -1)
+      
+      # Set defaults if invalid
+      [ -z "$R1" ] && R1=0
+      [ -z "$G1" ] && G1=0
+      [ -z "$B1" ] && B1=0
+      [ -z "$R2" ] && R2=0
+      [ -z "$G2" ] && G2=0
+      [ -z "$B2" ] && B2=0
+      
+      # Ensure values are in valid range
+      R1=$(( R1 > 255 ? 255 : R1 ))
+      G1=$(( G1 > 255 ? 255 : G1 ))
+      B1=$(( B1 > 255 ? 255 : B1 ))
+      R2=$(( R2 > 255 ? 255 : R2 ))
+      G2=$(( G2 > 255 ? 255 : G2 ))
+      B2=$(( B2 > 255 ? 255 : B2 ))
+      
+      # Update the array with validated values
+      FINAL_COLORS[$i]="$R1,$G1,$B1"
+      FINAL_COLORS[$j]="$R2,$G2,$B2"
+      
+      # Calculate color difference using a simple Euclidean distance
+      COLOR_DIFF=$(echo "scale=2; sqrt(($R1-$R2)^2 + ($G1-$G2)^2 + ($B1-$B2)^2)" | bc -l)
+      
+      if (( $(echo "$COLOR_DIFF < $COLOR_SIMILARITY_THRESHOLD" | bc -l) )); then
+        SIMILARITY_COUNT=$((SIMILARITY_COUNT + 1))
+      fi
+    done
+  done
+  
+  # If more than half of the color pairs are too similar, use complementary colors instead
+  if [ $SIMILARITY_COUNT -gt $(($NUM_COLORS * ($NUM_COLORS - 1) / 4)) ]; then
+    log_message "Detected too many similar colors. Generating complementary colors."
     
-    # Update the array with processed values
-    COLORS_ARRAY[$i]="$R,$G,$B"
+    # Keep the first color and generate complementary ones
+    BASE_COLOR=${FINAL_COLORS[0]}
+    IFS=',' read -r R G B <<< "$BASE_COLOR"
+    
+    # Ensure the base color is vibrant
+    # Find the max channel
+    MAX_CHANNEL=$R
+    MAX_COLOR="R"
+    if [ $G -gt $MAX_CHANNEL ]; then
+      MAX_CHANNEL=$G
+      MAX_COLOR="G"
+    fi
+    if [ $B -gt $MAX_CHANNEL ]; then
+      MAX_CHANNEL=$B
+      MAX_COLOR="B"
+    fi
+    
+    # Boost the max channel and reduce others to create a more vibrant base
+    case $MAX_COLOR in
+      "R")
+        R=$(( R < 200 ? R + 55 : 255 ))
+        G=$(( G > 50 ? G - 30 : 0 ))
+        B=$(( B > 50 ? B - 30 : 0 ))
+        ;;
+      "G")
+        G=$(( G < 200 ? G + 55 : 255 ))
+        R=$(( R > 50 ? R - 30 : 0 ))
+        B=$(( B > 50 ? B - 30 : 0 ))
+        ;;
+      "B")
+        B=$(( B < 200 ? B + 55 : 255 ))
+        R=$(( R > 50 ? R - 30 : 0 ))
+        G=$(( G > 50 ? G - 30 : 0 ))
+        ;;
+    esac
+    
+    # Validate RGB values
+    R=$(( R > 255 ? 255 : (R < 0 ? 0 : R) ))
+    G=$(( G > 255 ? 255 : (G < 0 ? 0 : G) ))
+    B=$(( B > 255 ? 255 : (B < 0 ? 0 : B) ))
+    
+    # Update the base color
+    FINAL_COLORS[0]="$R,$G,$B"
+    
+    # Generate complementary colors with evenly distributed hues
+    for ((i=1; i<$NUM_COLORS; i++)); do
+      # Calculate hue offset based on position (distribute evenly around color wheel)
+      local HUE_OFFSET=$((360 / NUM_COLORS * i))
+      
+      # Use ImageMagick to create the complementary color
+      TEMP_COLOR_FILE="$TEMP_PROCESS_DIR/comp_color_$i.png"
+      
+      # Use printf to ensure proper RGB format
+      echo "rgb($R,$G,$B)" | magick -size 1x1 xc:- -colorspace HSL \
+        -modulate 100,100,$((100 + HUE_OFFSET)) -colorspace sRGB \
+        -format "%[fx:int(255*r)],%[fx:int(255*g)],%[fx:int(255*b)]" info: > "$TEMP_COLOR_FILE" 2>/dev/null
+      
+      # Extract and validate the RGB values
+      NEW_RGB=$(cat "$TEMP_COLOR_FILE" | sed -E 's/[^0-9,]//g')
+      
+      # Check if values are valid
+      IFS=',' read -r NR NG NB <<< "$NEW_RGB"
+      if [[ -z "$NR" || -z "$NG" || -z "$NB" ]] || \
+         [[ "$NR" -gt 255 || "$NG" -gt 255 || "$NB" -gt 255 ]]; then
+        # Use fallback complementary colors
+        case $i in
+          1) NEW_RGB="0,255,255" ;;  # Cyan
+          2) NEW_RGB="255,0,255" ;;  # Magenta
+          3) NEW_RGB="255,255,0" ;;  # Yellow
+          *) NEW_RGB="128,0,255" ;;  # Purple
+        esac
+      fi
+      
+      FINAL_COLORS[$i]=$NEW_RGB
+    done
+  fi
+  
+  # Ensure colors are valid and enhance them
+  for ((i=0; i<$NUM_COLORS; i++)); do
+    # Parse RGB values
+    IFS=',' read -r R G B <<< "${FINAL_COLORS[$i]}"
+    
+    # Ensure values are integers and not empty
+    R=$(echo "$R" | grep -o '[0-9]*' | head -1)
+    G=$(echo "$G" | grep -o '[0-9]*' | head -1)
+    B=$(echo "$B" | grep -o '[0-9]*' | head -1)
+    
+    # Validate and set defaults if values are invalid
+    if [[ -z "$R" || -z "$G" || -z "$B" || "$R" -gt 255 || "$G" -gt 255 || "$B" -gt 255 ]]; then
+      # If extraction totally failed, use a vibrant default
+      case $i in
+        0) R=255; G=0; B=0 ;;    # Red
+        1) R=0; G=255; B=0 ;;    # Green
+        2) R=0; G=0; B=255 ;;    # Blue
+        *) R=255; G=255; B=0 ;;  # Yellow
+      esac
+    fi
+    
+    # Ensure values are in valid range
+    R=$(( R > 255 ? 255 : (R < 0 ? 0 : R) ))
+    G=$(( G > 255 ? 255 : (G < 0 ? 0 : G) ))
+    B=$(( B > 255 ? 255 : (B < 0 ? 0 : B) ))
+    
+    # Enhance color vibrance - boost the dominant channel
+    MAX_CHANNEL=$R
+    if [ $G -gt $MAX_CHANNEL ]; then MAX_CHANNEL=$G; fi
+    if [ $B -gt $MAX_CHANNEL ]; then MAX_CHANNEL=$B; fi
+    
+    # Adjust the dominant channel saturation if colors are dull
+    if [ $MAX_CHANNEL -lt 100 ]; then
+      if [ $R -eq $MAX_CHANNEL ]; then R=$((R + 100)); fi
+      if [ $G -eq $MAX_CHANNEL ]; then G=$((G + 100)); fi
+      if [ $B -eq $MAX_CHANNEL ]; then B=$((B + 100)); fi
+      
+      # Cap at 255
+        if [ $R -gt 255 ]; then R=255; fi
+        if [ $G -gt 255 ]; then G=255; fi
+        if [ $B -gt 255 ]; then B=255; fi
+    fi
+    
+    # Update the array with enhanced values
+    FINAL_COLORS[$i]="$R,$G,$B"
   done
   
   # Cleanup temp files
   rm -rf "$TEMP_PROCESS_DIR"
   
-  # Get the current color to use (alternate between them)
-  COLOR_INDEX=$((COLOR_INDEX % NUM_COLORS))
-  CURRENT_RGB=${COLORS_ARRAY[$COLOR_INDEX]}
+  # Get the first color to use immediately
+  COLOR_INDEX=0
+  CURRENT_RGB=${FINAL_COLORS[$COLOR_INDEX]}
   
   # Parse RGB values
-  R=$(echo "$CURRENT_RGB" | cut -d "," -f 1)
-  G=$(echo "$CURRENT_RGB" | cut -d "," -f 2)
-  B=$(echo "$CURRENT_RGB" | cut -d "," -f 3)
+  IFS=',' read -r R G B <<< "$CURRENT_RGB"
   
-  # Update if the color index changed or artwork has changed
-  if [[ "$COLOR_INDEX" != "$LAST_COLOR_INDEX" || "$R" != "$LAST_R" || "$G" != "$LAST_G" || "$B" != "$LAST_B" ]]; then
-    echo "[$TIMESTAMP] ACTIVE: $PLAYER_NAME - \"$TRACK_TITLE\""
-    echo "[$TIMESTAMP] Color extracted: R=$R G=$G B=$B (Color index: $COLOR_INDEX)"
-    
-    # Prepare payload
-    PAYLOAD="{\"rgb\": [$R, $G, $B]}"
-    
-    # Send to Home Assistant webhook
-    curl -s -X POST \
-      -H "Content-Type: application/json" \
-      -d "$PAYLOAD" \
-      "$WEBHOOK_URL"
-    
-    echo "[$TIMESTAMP] Sent to Home Assistant"
-    
-    # Update last RGB values
-    LAST_R="$R"
-    LAST_G="$G"
-    LAST_B="$B"
-    LAST_COLOR_INDEX="$COLOR_INDEX"
-    
-    # Increment the color index for next time
-    COLOR_INDEX=$((COLOR_INDEX + 1))
-    log_message "Incremented COLOR_INDEX to $COLOR_INDEX" 
+  # Always set the first color immediately
+  TIMESTAMP=$(date "+%H:%M:%S")
+  echo "[$TIMESTAMP] ACTIVE: $PLAYER_NAME - \"$TRACK_TITLE\""
+  echo "[$TIMESTAMP] Color extracted: R=$R G=$G B=$B (Color index: $COLOR_INDEX)"
+  
+  # Prepare payload
+  PAYLOAD="{\"rgb\": [$R, $G, $B]}"
+  
+  # Send to Home Assistant webhook
+  curl -s -X POST \
+    -H "Content-Type: application/json" \
+    -d "$PAYLOAD" \
+    "$WEBHOOK_URL"
+  
+  TIMESTAMP=$(date "+%H:%M:%S")
+  echo "[$TIMESTAMP] Sent to Home Assistant"
+  
+  # Update last RGB values
+  LAST_R="$R"
+  LAST_G="$G"
+  LAST_B="$B"
+  LAST_COLOR_INDEX="$COLOR_INDEX"
+  
+  # Log all extracted colors for debugging
+  log_message "Extracted colors:"
+  for ((i=0; i<$NUM_COLORS; i++)); do
+    IFS=',' read -r R G B <<< "${FINAL_COLORS[$i]}"
+    log_message "Color $i: R=$R G=$G B=$B"
+  done
+  
+  # Save all extracted colors to global cache
+  COLORS_CACHE=""
+  for ((i=0; i<$NUM_COLORS; i++)); do
+    if [ $i -gt 0 ]; then
+      COLORS_CACHE="$COLORS_CACHE|${FINAL_COLORS[$i]}"
+    else
+      COLORS_CACHE="${FINAL_COLORS[$i]}"
+    fi
+  done
+  
+  # Start background color alternation if enabled
+  if [ $NUM_COLORS -gt 1 ]; then
+    log_message "Starting background color alternation with ${#FINAL_COLORS[@]} colors"
+    # Start the background process - skip passing redundant arguments to reduce duplicate logging
+    alternate_colors_background "$ALTERNATION_DELAY" "${FINAL_COLORS[0]}" "${FINAL_COLORS[1]}" "${FINAL_COLORS[2]}" "$NUM_COLORS" "$WEBHOOK_URL" "$PLAYER_NAME" "$TRACK_TITLE" &
+    COLOR_ALTERNATION_PID=$!
+    log_message "Background color alternation started with PID: $COLOR_ALTERNATION_PID"
+  else
+    log_message "Color alternation disabled (NUM_COLORS=$NUM_COLORS)"
   fi
 }
 
@@ -504,138 +872,14 @@ while true; do
     done
   fi
   
-  # Force color alternation even when no new artwork is found
-  if ! $ARTWORK_UPDATED && [ -n "$LAST_R" ] && [ -n "$LAST_G" ] && [ -n "$LAST_B" ]; then
-    COLOR_INDEX=$((COLOR_INDEX % NUM_COLORS))
-    log_message "Checking color alternation - Current index: $COLOR_INDEX, Last index: $LAST_COLOR_INDEX"
-    if [ "$COLOR_INDEX" != "$LAST_COLOR_INDEX" ]; then
-      log_message "Color indices differ, attempting alternation"
-      # Find the active player
-      FOUND_ACTIVE_PLAYER=false
-      
-      # First check all players including Spotify
-      for PLAYER in $PLAYERS; do
-        STATUS=$(playerctl -p "$PLAYER" status 2>/dev/null)
-        if [[ "$STATUS" == "Playing" ]]; then
-          # Skip video players but allow Spotify for alternation
-          if [[ "$PLAYER" == *"haruna"* || 
-                "$PLAYER" == *"vlc"* || "$PLAYER" == *"mpv"* || 
-                "$PLAYER" == *"celluloid"* || "$PLAYER" == *"totem"* || 
-                "$PLAYER" == *"kdeconnect"* ]]; then
-            log_message "Skipping excluded player: $PLAYER for alternation"
-            continue
-          fi
-          
-          # Get current track info
-          CURRENT_TITLE=$(playerctl -p "$PLAYER" metadata xesam:title 2>/dev/null)
-          if [ -n "$CURRENT_TITLE" ]; then
-            log_message "Found eligible player for alternation: $PLAYER playing $CURRENT_TITLE"
-            FOUND_ACTIVE_PLAYER=true
-            # Use the currently active colors but with the next index
-            TRACK_TITLE="$CURRENT_TITLE (alternated)"
-            
-            # Get color for current index from the last extracted colors
-            for ((i=0; i<$NUM_COLORS; i++)); do
-              if [ "$i" == "$COLOR_INDEX" ]; then
-                R=$((LAST_R + (i * 20 - 40)))
-                G=$((LAST_G + (i * 20 - 40)))
-                B=$((LAST_B + (i * 20 - 40)))
-                
-                # Ensure values are within range
-                [ $R -lt 0 ] && R=0
-                [ $G -lt 0 ] && G=0
-                [ $B -lt 0 ] && B=0
-                [ $R -gt 255 ] && R=255
-                [ $G -gt 255 ] && G=255
-                [ $B -gt 255 ] && B=255
-                
-                # Send the alternate color
-                TIMESTAMP=$(date "+%H:%M:%S")
-                echo "[$TIMESTAMP] Alternating colors for: $PLAYER - \"$TRACK_TITLE\""
-                echo "[$TIMESTAMP] Alternate color: R=$R G=$G B=$B (Color index: $COLOR_INDEX)"
-                
-                # Prepare payload
-                PAYLOAD="{\"rgb\": [$R, $G, $B]}"
-                
-                # Send to Home Assistant webhook
-                curl -s -X POST \
-                  -H "Content-Type: application/json" \
-                  -d "$PAYLOAD" \
-                  "$WEBHOOK_URL"
-                
-                echo "[$TIMESTAMP] Sent alternated color to Home Assistant"
-                LAST_COLOR_INDEX="$COLOR_INDEX"
-                COLOR_INDEX=$((COLOR_INDEX + 1))
-                log_message "Incremented COLOR_INDEX to $COLOR_INDEX for alternation"
-                
-                # Mark as updated so we don't do this multiple times per cycle
-                ARTWORK_UPDATED=true
-                break
-              fi
-            done
-            break
-          else
-            log_message "Player $PLAYER has no track title"
-          fi
-        else
-          log_message "Player $PLAYER is not playing (status: $STATUS)"
-        fi
-      done
-      
-      # If no eligible player found, use the last active track info for alternation
-      if ! $FOUND_ACTIVE_PLAYER && [ -n "$LAST_TRACK" ] && [ -n "$LAST_PLAYER" ]; then
-        log_message "No eligible active player found, using last track: $LAST_TRACK from $LAST_PLAYER"
-        
-        # Use the last track info
-        TRACK_TITLE="$LAST_TRACK (alternated)"
-        
-        # Apply the same color alternation logic
-        for ((i=0; i<$NUM_COLORS; i++)); do
-          if [ "$i" == "$COLOR_INDEX" ]; then
-            R=$((LAST_R + (i * 20 - 40)))
-            G=$((LAST_G + (i * 20 - 40)))
-            B=$((LAST_B + (i * 20 - 40)))
-            
-            # Ensure values are within range
-            [ $R -lt 0 ] && R=0
-            [ $G -lt 0 ] && G=0
-            [ $B -lt 0 ] && B=0
-            [ $R -gt 255 ] && R=255
-            [ $G -gt 255 ] && G=255
-            [ $B -gt 255 ] && B=255
-            
-            # Send the alternate color
-            TIMESTAMP=$(date "+%H:%M:%S")
-            echo "[$TIMESTAMP] Alternating colors for last track: $LAST_PLAYER - \"$TRACK_TITLE\""
-            echo "[$TIMESTAMP] Alternate color: R=$R G=$G B=$B (Color index: $COLOR_INDEX)"
-            
-            # Prepare payload
-            PAYLOAD="{\"rgb\": [$R, $G, $B]}"
-            
-            # Send to Home Assistant webhook
-            curl -s -X POST \
-              -H "Content-Type: application/json" \
-              -d "$PAYLOAD" \
-              "$WEBHOOK_URL"
-            
-            echo "[$TIMESTAMP] Sent alternated color to Home Assistant for last track"
-            LAST_COLOR_INDEX="$COLOR_INDEX"
-            COLOR_INDEX=$((COLOR_INDEX + 1))
-            log_message "Incremented COLOR_INDEX to $COLOR_INDEX for alternation with last track"
-            
-            # Mark as updated so we don't do this multiple times per cycle
-            ARTWORK_UPDATED=true
-            break
-          fi
-        done
-      elif ! $FOUND_ACTIVE_PLAYER; then
-        log_message "No eligible active player found and no last track info available"
-      fi
-    fi
+  # Check every POLL_INTERVAL seconds for new tracks
+  # Only log on first run or when something changes
+  if $FIRST_RUN; then
+  log_message "Sleeping for $POLL_INTERVAL seconds to check for a different track"
   fi
-  
-  # Check every POLL_INTERVAL seconds
-  log_message "Sleeping for $POLL_INTERVAL seconds"
   sleep $POLL_INTERVAL
 done
+
+# Make sure to clean up background processes when script exits
+trap "stop_background_alternation" EXIT
 
