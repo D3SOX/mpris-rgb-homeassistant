@@ -409,6 +409,11 @@ while true; do
         continue
       fi
       
+      # Skip Haruna video player
+      if [[ "$PLAYER" == *"haruna"* ]]; then
+        continue
+      fi
+      
       # Only check players that are playing
       STATUS=$(playerctl -p "$PLAYER" status 2>/dev/null)
       if [[ "$STATUS" != "Playing" ]]; then
