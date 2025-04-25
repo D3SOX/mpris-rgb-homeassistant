@@ -409,8 +409,13 @@ while true; do
         continue
       fi
       
-      # Skip Haruna video player
-      if [[ "$PLAYER" == *"haruna"* ]]; then
+      # Skip players we want to ignore
+      if [[ "$PLAYER" == *"haruna"* || 
+            "$PLAYER" == *"vlc"* || 
+            "$PLAYER" == *"mpv"* || 
+            "$PLAYER" == *"celluloid"* || 
+            "$PLAYER" == *"totem"* || 
+            "$PLAYER" == *"kdeconnect"* ]]; then
         continue
       fi
       
