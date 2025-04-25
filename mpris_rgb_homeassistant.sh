@@ -8,6 +8,8 @@ fi
 # Configuration variables
 POLL_INTERVAL=2
 TEMP_DIR="/tmp/mpris_covers"
+NUM_COLORS=3  # Number of colors to extract
+COLOR_INDEX=0  # Track which color to use
 
 # Check if required variables are set
 if [ -z "$WEBHOOK_URL" ]; then
@@ -163,89 +165,127 @@ process_artwork() {
   # Create color swatches from the image
   magick "$TEMP_PROCESS_DIR/vibrant.jpg" -colors 16 -unique-colors "$TEMP_PROCESS_DIR/colors.gif"
   
-  # Split the image into tiles and find the most colorful tile
+  # Split the image into tiles and find the most colorful tiles
   magick "$TEMP_PROCESS_DIR/vibrant.jpg" -crop 4x4@ +repage +adjoin "$TEMP_PROCESS_DIR/tile_%d.jpg"
   
-  # Find the most saturated tile
-  MAX_SATURATION=0
-  MOST_SATURATED_TILE=""
+  # Extract multiple colors from different tiles
+  declare -a COLORS_ARRAY
+  declare -a SATURATION_ARRAY
   
+  # Initialize arrays
+  for ((i=0; i<$NUM_COLORS; i++)); do
+    COLORS_ARRAY[$i]="0,0,0"
+    SATURATION_ARRAY[$i]=0
+  done
+  
+  # Analyze each tile for saturation and color
   for TILE in "$TEMP_PROCESS_DIR"/tile_*.jpg; do
     # Calculate average saturation (using HSL colorspace where saturation is the second channel)
     SATURATION=$(magick "$TILE" -colorspace HSL -format "%[fx:mean.g*100]" info:)
-    if (( $(echo "$SATURATION > $MAX_SATURATION" | bc -l 2>/dev/null) )); then
-      MAX_SATURATION=$SATURATION
-      MOST_SATURATED_TILE="$TILE"
-    fi
+    
+    # Extract color from tile
+    TILE_RGB=$(magick "$TILE" -resize 1x1\! \
+      -format "%[fx:int(255*r)],%[fx:int(255*g)],%[fx:int(255*b)]" info:)
+    
+    # Check if this color is more saturated than our current colors
+    for ((i=0; i<$NUM_COLORS; i++)); do
+      if (( $(echo "$SATURATION > ${SATURATION_ARRAY[$i]}" | bc -l 2>/dev/null) )); then
+        # Shift the rest of the array to make room
+        for ((j=$NUM_COLORS-1; j>$i; j--)); do
+          SATURATION_ARRAY[$j]=${SATURATION_ARRAY[$j-1]}
+          COLORS_ARRAY[$j]=${COLORS_ARRAY[$j-1]}
+        done
+        
+        # Insert the new color
+        SATURATION_ARRAY[$i]=$SATURATION
+        COLORS_ARRAY[$i]=$TILE_RGB
+        break
+      fi
+    done
   done
   
-  # If we found a saturated tile, extract color from it
-  if [[ -n "$MOST_SATURATED_TILE" && -f "$MOST_SATURATED_TILE" ]]; then
-    RGB=$(magick "$MOST_SATURATED_TILE" -resize 1x1\! \
-          -format "%[fx:int(255*r)],%[fx:int(255*g)],%[fx:int(255*b)]" info:)
-  else
-    # Fallback: extract from the colors.gif directly
-    RGB=$(magick "$TEMP_PROCESS_DIR/colors.gif" -format "%[pixel:p{0,0}]" info: | 
-          sed 's/srgb(//' | sed 's/)//' | tr ',' ' ' | 
-          awk '{printf("%d,%d,%d", $1*255, $2*255, $3*255)}')
+  # If we couldn't extract enough colors, fall back to the colors.gif
+  if [[ "${COLORS_ARRAY[0]}" == "0,0,0" ]]; then
+    log_message "Falling back to color palette extraction"
+    # Extract top colors from the palette
+    for ((i=0; i<$NUM_COLORS; i++)); do
+      COLORS_ARRAY[$i]=$(magick "$TEMP_PROCESS_DIR/colors.gif" -format "%[pixel:p{$i,0}]" info: | 
+        sed 's/srgb(//' | sed 's/)//' | tr ',' ' ' | 
+        awk '{printf("%d,%d,%d", $1*255, $2*255, $3*255)}')
+    done
   fi
   
-  # Parse RGB values
-  R=$(echo "$RGB" | cut -d "," -f 1)
-  G=$(echo "$RGB" | cut -d "," -f 2)
-  B=$(echo "$RGB" | cut -d "," -f 3)
-  
-  # Ensure values are integers and not empty
-  R=$(echo "$R" | sed 's/[^0-9]//g')
-  G=$(echo "$G" | sed 's/[^0-9]//g')
-  B=$(echo "$B" | sed 's/[^0-9]//g')
-  
-  # Validate all values
-  if [[ -z "$R" || -z "$G" || -z "$B" ]]; then
-    # If extraction totally failed, use a vibrant default
-    R=128
-    G=0
-    B=128
-  fi
-  
-  # If all colors are too similar (grayscale), boost the dominant channel
-  RANGE=$(($(echo "$R $G $B" | tr ' ' '\n' | sort -nr | head -1) - $(echo "$R $G $B" | tr ' ' '\n' | sort -n | head -1)))
-  if [ $RANGE -lt 30 ]; then
-    # Find the highest channel and boost it
-    if [ $R -ge $G ] && [ $R -ge $B ]; then
-      # Red is highest, boost it
-      R=$((R + 50))
-      if [ $R -gt 255 ]; then R=255; fi
-      G=$((G - 20))
-      if [ $G -lt 0 ]; then G=0; fi
-      B=$((B - 20))
-      if [ $B -lt 0 ]; then B=0; fi
-    elif [ $G -ge $R ] && [ $G -ge $B ]; then
-      # Green is highest, boost it
-      G=$((G + 50))
-      if [ $G -gt 255 ]; then G=255; fi
-      R=$((R - 20))
-      if [ $R -lt 0 ]; then R=0; fi
-      B=$((B - 20))
-      if [ $B -lt 0 ]; then B=0; fi
-    else
-      # Blue is highest, boost it
-      B=$((B + 50))
-      if [ $B -gt 255 ]; then B=255; fi
-      R=$((R - 20))
-      if [ $R -lt 0 ]; then R=0; fi
-      G=$((G - 20))
-      if [ $G -lt 0 ]; then G=0; fi
+  # Ensure we have valid colors
+  for ((i=0; i<$NUM_COLORS; i++)); do
+    # Parse RGB values
+    R=$(echo "${COLORS_ARRAY[$i]}" | cut -d "," -f 1)
+    G=$(echo "${COLORS_ARRAY[$i]}" | cut -d "," -f 2)
+    B=$(echo "${COLORS_ARRAY[$i]}" | cut -d "," -f 3)
+    
+    # Ensure values are integers and not empty
+    R=$(echo "$R" | sed 's/[^0-9]//g')
+    G=$(echo "$G" | sed 's/[^0-9]//g')
+    B=$(echo "$B" | sed 's/[^0-9]//g')
+    
+    # Validate all values
+    if [[ -z "$R" || -z "$G" || -z "$B" ]]; then
+      # If extraction totally failed, use a vibrant default
+      R=128
+      G=$((50 + 50*i))
+      B=128
     fi
-  fi
+    
+    # If all colors are too similar (grayscale), boost the dominant channel
+    RANGE=$(($(echo "$R $G $B" | tr ' ' '\n' | sort -nr | head -1) - $(echo "$R $G $B" | tr ' ' '\n' | sort -n | head -1)))
+    if [ $RANGE -lt 30 ]; then
+      # Find the highest channel and boost it
+      if [ $R -ge $G ] && [ $R -ge $B ]; then
+        # Red is highest, boost it
+        R=$((R + 50))
+        if [ $R -gt 255 ]; then R=255; fi
+        G=$((G - 20))
+        if [ $G -lt 0 ]; then G=0; fi
+        B=$((B - 20))
+        if [ $B -lt 0 ]; then B=0; fi
+      elif [ $G -ge $R ] && [ $G -ge $B ]; then
+        # Green is highest, boost it
+        G=$((G + 50))
+        if [ $G -gt 255 ]; then G=255; fi
+        R=$((R - 20))
+        if [ $R -lt 0 ]; then R=0; fi
+        B=$((B - 20))
+        if [ $B -lt 0 ]; then B=0; fi
+      else
+        # Blue is highest, boost it
+        B=$((B + 50))
+        if [ $B -gt 255 ]; then B=255; fi
+        R=$((R - 20))
+        if [ $R -lt 0 ]; then R=0; fi
+        G=$((G - 20))
+        if [ $G -lt 0 ]; then G=0; fi
+      fi
+    fi
+    
+    # Update the array with processed values
+    COLORS_ARRAY[$i]="$R,$G,$B"
+  done
   
   # Cleanup temp files
   rm -rf "$TEMP_PROCESS_DIR"
   
+  # Get the current color to use (alternate between them)
+  COLOR_INDEX=$((COLOR_INDEX % NUM_COLORS))
+  CURRENT_RGB=${COLORS_ARRAY[$COLOR_INDEX]}
+  
+  # Parse RGB values
+  R=$(echo "$CURRENT_RGB" | cut -d "," -f 1)
+  G=$(echo "$CURRENT_RGB" | cut -d "," -f 2)
+  B=$(echo "$CURRENT_RGB" | cut -d "," -f 3)
+  
   # Only update if the color has actually changed
   if [[ "$R" != "$LAST_R" || "$G" != "$LAST_G" || "$B" != "$LAST_B" ]]; then
     echo "[$TIMESTAMP] ACTIVE: $PLAYER_NAME - \"$TRACK_TITLE\""
-    echo "[$TIMESTAMP] Color extracted: R=$R G=$G B=$B"
+    echo "[$TIMESTAMP] Color extracted: R=$R G=$G B=$B (Color index: $COLOR_INDEX)"
     
     # Prepare payload
     PAYLOAD="{\"rgb\": [$R, $G, $B]}"
@@ -263,6 +303,9 @@ process_artwork() {
     LAST_G="$G"
     LAST_B="$B"
   fi
+  
+  # Increment the color index for next time
+  COLOR_INDEX=$((COLOR_INDEX + 1))
 }
 
 # Function to log with timestamp

@@ -68,8 +68,17 @@ triggers:
       - PUT
     local_only: false
     webhook_id: "unique_webhook_id"  # Generate a unique ID or string
-conditions: []
+conditions:
+  - condition: state
+    entity_id: input_boolean.sync_bulb_right_wall
+    state: "on"
 actions:
+  - action: yeelight.set_music_mode
+    metadata: {}
+    data:
+      music_mode: true
+    target:
+      entity_id: light.your_rgb_light  # Replace with your light entity
   - action: light.turn_on
     metadata: {}
     data:
@@ -88,6 +97,39 @@ http://your-home-assistant:8123/api/webhook/unique_webhook_id
 ```
 
 The script will send RGB color data to this webhook, which Home Assistant will then apply to your light.
+
+## Multi-Color Extraction and Alternation
+
+This script supports extracting multiple dominant colors from artwork and alternating between them for more dynamic lighting effects:
+
+### How It Works
+
+1. The script extracts multiple colors (default: 3) from each artwork in order of vibrancy/saturation
+2. With each update, it alternates between these colors, creating a rhythmic effect
+3. The sequence repeats with each new track's artwork
+
+### Configuring Multi-Color
+
+You can adjust the number of colors extracted by modifying these variables at the top of the script:
+```bash
+NUM_COLORS=3  # Number of colors to extract
+COLOR_INDEX=0  # Track which color to use (don't change this)
+```
+
+### Yeelight Music Mode
+
+If using Yeelight bulbs, enabling Music Mode provides smoother transitions. The example Home Assistant automation above includes the necessary action to enable music mode before applying color changes.
+
+For even smoother color transitions with Yeelight bulbs:
+1. Enable the extra `yeelight.set_music_mode` action in your Home Assistant webhook automation
+2. Adjust the transition time based on your preferences
+
+### Excluding Media Players
+
+The script automatically excludes certain media players to prevent unwanted color changes:
+- Video players (haruna, vlc, mpv, celluloid, totem)
+- KDE Connect duplicates
+- Other media players can be added to the exclusion list in the script
 
 ## Remote API Access
 
