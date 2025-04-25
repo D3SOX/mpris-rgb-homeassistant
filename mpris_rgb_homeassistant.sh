@@ -70,6 +70,34 @@ find_music_file() {
     fi
   fi
   
+  # If still not found, try with a more aggressive approach for handling special characters
+  if [[ -z "$MUSIC_FILE" ]]; then
+    # Create a simplified track title by replacing special characters
+    # Replace special Unicode characters with ASCII equivalents
+    SIMPLIFIED_TITLE=$(echo "$TRACK_TITLE" | 
+      tr '|｜' '**' |  # Replace both normal and fullwidth vertical bars with wildcards
+      tr '[]{})(' '******' |  # Replace brackets with wildcards
+      tr ':;,.!?' '******')  # Replace punctuation with wildcards
+    
+    # Try with simplified title pattern
+    MUSIC_FILE=$(find "$MUSIC_DIR" -type f -iname "*$(echo "$SIMPLIFIED_TITLE" | tr ' ' '*')*.mp3" | head -n 1)
+    
+    # As a last resort, try just the main parts without special chars
+    if [[ -z "$MUSIC_FILE" && "$TRACK_TITLE" == *" - "* ]]; then
+      # Get parts before and after the hyphen
+      PART1=$(echo "$TRACK_TITLE" | cut -d'-' -f1 | tr -d '[:punct:]' | tr -d '[:cntrl:]' | tr ' ' '*')
+      PART2=$(echo "$TRACK_TITLE" | cut -d'-' -f2 | tr -d '[:punct:]' | tr -d '[:cntrl:]' | tr ' ' '*')
+      
+      # Try to find a file containing both parts in any order
+      MUSIC_FILE=$(find "$MUSIC_DIR" -type f -iname "*${PART1}*${PART2}*.mp3" | head -n 1)
+      
+      # If that fails, try the other way around
+      if [[ -z "$MUSIC_FILE" ]]; then
+        MUSIC_FILE=$(find "$MUSIC_DIR" -type f -iname "*${PART2}*${PART1}*.mp3" | head -n 1)
+      fi
+    fi
+  fi
+  
   echo "$MUSIC_FILE"
 }
 
@@ -124,13 +152,95 @@ process_artwork() {
     curl -s "$ART_SOURCE" -o "$COVER_PATH"
   fi
   
-  # Get the dominant color in 0-255 format
-  RGB=$(magick "$COVER_PATH" -resize 1x1\! -format "%[fx:int(255*r+.5)],%[fx:int(255*g+.5)],%[fx:int(255*b+.5)]" info:-)
+  # Create a temporary directory for processing
+  local TEMP_PROCESS_DIR="$TEMP_DIR/process_$$"
+  mkdir -p "$TEMP_PROCESS_DIR"
+  
+  # Method 1: Extract the most vibrant colors using advanced processing
+  # First, extract a high-contrast, saturated version of the image
+  magick "$COVER_PATH" -modulate 100,250,100 -contrast-stretch 3%x15% "$TEMP_PROCESS_DIR/vibrant.jpg"
+  
+  # Create color swatches from the image
+  magick "$TEMP_PROCESS_DIR/vibrant.jpg" -colors 16 -unique-colors "$TEMP_PROCESS_DIR/colors.gif"
+  
+  # Split the image into tiles and find the most colorful tile
+  magick "$TEMP_PROCESS_DIR/vibrant.jpg" -crop 4x4@ +repage +adjoin "$TEMP_PROCESS_DIR/tile_%d.jpg"
+  
+  # Find the most saturated tile
+  MAX_SATURATION=0
+  MOST_SATURATED_TILE=""
+  
+  for TILE in "$TEMP_PROCESS_DIR"/tile_*.jpg; do
+    # Calculate average saturation (using HSL colorspace where saturation is the second channel)
+    SATURATION=$(magick "$TILE" -colorspace HSL -format "%[fx:mean.g*100]" info:)
+    if (( $(echo "$SATURATION > $MAX_SATURATION" | bc -l 2>/dev/null) )); then
+      MAX_SATURATION=$SATURATION
+      MOST_SATURATED_TILE="$TILE"
+    fi
+  done
+  
+  # If we found a saturated tile, extract color from it
+  if [[ -n "$MOST_SATURATED_TILE" && -f "$MOST_SATURATED_TILE" ]]; then
+    RGB=$(magick "$MOST_SATURATED_TILE" -resize 1x1\! \
+          -format "%[fx:int(255*r)],%[fx:int(255*g)],%[fx:int(255*b)]" info:)
+  else
+    # Fallback: extract from the colors.gif directly
+    RGB=$(magick "$TEMP_PROCESS_DIR/colors.gif" -format "%[pixel:p{0,0}]" info: | 
+          sed 's/srgb(//' | sed 's/)//' | tr ',' ' ' | 
+          awk '{printf("%d,%d,%d", $1*255, $2*255, $3*255)}')
+  fi
   
   # Parse RGB values
   R=$(echo "$RGB" | cut -d "," -f 1)
   G=$(echo "$RGB" | cut -d "," -f 2)
   B=$(echo "$RGB" | cut -d "," -f 3)
+  
+  # Ensure values are integers and not empty
+  R=$(echo "$R" | sed 's/[^0-9]//g')
+  G=$(echo "$G" | sed 's/[^0-9]//g')
+  B=$(echo "$B" | sed 's/[^0-9]//g')
+  
+  # Validate all values
+  if [[ -z "$R" || -z "$G" || -z "$B" ]]; then
+    # If extraction totally failed, use a vibrant default
+    R=128
+    G=0
+    B=128
+  fi
+  
+  # If all colors are too similar (grayscale), boost the dominant channel
+  RANGE=$(($(echo "$R $G $B" | tr ' ' '\n' | sort -nr | head -1) - $(echo "$R $G $B" | tr ' ' '\n' | sort -n | head -1)))
+  if [ $RANGE -lt 30 ]; then
+    # Find the highest channel and boost it
+    if [ $R -ge $G ] && [ $R -ge $B ]; then
+      # Red is highest, boost it
+      R=$((R + 50))
+      if [ $R -gt 255 ]; then R=255; fi
+      G=$((G - 20))
+      if [ $G -lt 0 ]; then G=0; fi
+      B=$((B - 20))
+      if [ $B -lt 0 ]; then B=0; fi
+    elif [ $G -ge $R ] && [ $G -ge $B ]; then
+      # Green is highest, boost it
+      G=$((G + 50))
+      if [ $G -gt 255 ]; then G=255; fi
+      R=$((R - 20))
+      if [ $R -lt 0 ]; then R=0; fi
+      B=$((B - 20))
+      if [ $B -lt 0 ]; then B=0; fi
+    else
+      # Blue is highest, boost it
+      B=$((B + 50))
+      if [ $B -gt 255 ]; then B=255; fi
+      R=$((R - 20))
+      if [ $R -lt 0 ]; then R=0; fi
+      G=$((G - 20))
+      if [ $G -lt 0 ]; then G=0; fi
+    fi
+  fi
+  
+  # Cleanup temp files
+  rm -rf "$TEMP_PROCESS_DIR"
   
   # Only update if the color has actually changed
   if [[ "$R" != "$LAST_R" || "$G" != "$LAST_G" || "$B" != "$LAST_B" ]]; then
