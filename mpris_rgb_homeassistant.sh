@@ -296,6 +296,9 @@ while true; do
         continue
       fi
       
+      # Set SPOTIFY_CHANGED to true whenever Spotify is playing
+      SPOTIFY_CHANGED=true
+      
       ART_URL=$(playerctl -p "$PLAYER" metadata mpris:artUrl 2>/dev/null)
       TRACK_URL=$(playerctl -p "$PLAYER" metadata xesam:url 2>/dev/null)
       TRACK_TITLE=$(playerctl -p "$PLAYER" metadata xesam:title 2>/dev/null)
