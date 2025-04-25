@@ -13,7 +13,7 @@ A service that connects your media players to Home Assistant RGB devices. This u
 1. Clone this repository to your local share directory:
 ```bash
 mkdir -p ~/.local/share/mpris-rgb-homeassistant
-git clone https://github.com/YOUR_USERNAME/mpris-rgb-homeassistant.git ~/.local/share/mpris-rgb-homeassistant
+git clone https://github.com/d3sox/mpris-rgb-homeassistant.git ~/.local/share/mpris-rgb-homeassistant
 cd ~/.local/share/mpris-rgb-homeassistant
 ```
 
