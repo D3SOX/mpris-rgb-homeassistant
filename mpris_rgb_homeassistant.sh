@@ -1,27 +1,208 @@
 #!/bin/bash
 
+# Common constants
+DEBUG_LOG="/tmp/mpris_rgb_debug.log"
+
 # Function to log with timestamp
 log_message() {
   local MSG="$1"
   local TIMESTAMP=$(date "+%H:%M:%S")
+  
+  # Add timestamps to log output
   echo "[$TIMESTAMP] $MSG"
+  
+  if [ "$VERBOSE_LOGGING" = "true" ]; then
+    echo "[$TIMESTAMP] $MSG" >> "$DEBUG_LOG"
+  fi
 }
 
-# Load environment variables from .env file
-if [ -f .env ]; then
-  # Process .env file line by line to properly handle inline comments
-  while IFS= read -r line; do
-    # Skip empty lines and comment lines
-    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
-    # Extract the variable part before any comment
-    var=$(echo "$line" | sed -E 's/[[:space:]]*#.*$//' | xargs)
-    # Only export if it's a valid variable assignment
-    [[ "$var" =~ ^[A-Za-z0-9_]+=.* ]] && export "$var"
-  done < .env
-  log_message "Loaded environment variables from .env file"
-else
-  log_message "Warning: .env file not found, using default values"
-fi
+# Helper function for HTTP requests to Home Assistant
+send_webhook_request() {
+  local RGB="$1"
+  local TRANSITION_TIME="${2:-1}"
+  
+  if [ "$VERBOSE_LOGGING" = "true" ]; then
+    log_message "Sending color: $RGB with transition: $TRANSITION_TIME"
+  fi
+  
+  # Prepare the JSON payload
+  local JSON="{\"rgb\":\"$RGB\",\"transition\":$TRANSITION_TIME}"
+  
+  # Send the webhook request
+  curl -s -X POST -H "Content-Type: application/json" \
+       -d "$JSON" "$WEBHOOK_URL" > /dev/null
+  
+  return $?
+}
+
+# Helper function to load environment variables
+load_environment() {
+  if [ -f .env ]; then
+    # Process .env file line by line to properly handle inline comments
+    while IFS= read -r line; do
+      # Skip empty lines and comment lines
+      [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+      # Extract the variable part before any comment
+      var=$(echo "$line" | sed -E 's/[[:space:]]*#.*$//' | xargs)
+      # Only export if it's a valid variable assignment
+      [[ "$var" =~ ^[A-Za-z0-9_]+=.* ]] && export "$var"
+    done < .env
+    log_message "Loaded environment variables from .env file"
+  else
+    log_message "Warning: .env file not found, using default values"
+  fi
+}
+
+# Helper function to validate required environment variables
+validate_requirements() {
+  local MISSING_VARS=0
+  
+  if [ -z "$WEBHOOK_URL" ]; then
+    log_message "Error: WEBHOOK_URL not defined in .env file"
+    MISSING_VARS=1
+  fi
+
+  if [ -z "$MUSIC_DIR" ]; then
+    log_message "Error: MUSIC_DIR not defined in .env file"
+    MISSING_VARS=1
+  fi
+  
+  if [ $MISSING_VARS -ne 0 ]; then
+    exit 1
+  fi
+}
+
+# Helper function to initialize directories
+initialize_directories() {
+  # Create temp directory
+  mkdir -p "$TEMP_DIR"
+  if [ ! -d "$TEMP_DIR" ]; then
+    log_message "Error: Failed to create temporary directory $TEMP_DIR"
+    exit 1
+  fi
+  
+  # Create BPM cache directory
+  mkdir -p "$BPM_CACHE_DIR"
+}
+
+# Helper function to extract colors from artwork
+extract_colors_from_artwork() {
+  local ARTWORK_PATH="$1"
+  local NUM_COLORS="$2"
+  
+  if [ ! -f "$ARTWORK_PATH" ]; then
+    log_message "Artwork file not found: $ARTWORK_PATH"
+    return 1
+  fi
+  
+  # Method 1: Use ImageMagick to extract dominant colors with increased saturation
+  local COLORS=""
+  
+  # First boost saturation before extracting colors to get more vibrant results
+  local ENHANCED_ART="$TEMP_DIR/enhanced_artwork.jpg"
+  convert "$ARTWORK_PATH" -modulate 100,150,100 -contrast-stretch 3%x15% "$ENHANCED_ART"
+  
+  # Extract colors from the enhanced artwork
+  COLORS=$(convert "$ENHANCED_ART" -resize 100x100 -define histogram:unique-colors=true \
+    -format "%c" histogram:info: | sort -nr | head -n "$NUM_COLORS" | \
+    grep -oE '#[0-9A-F]{6}' | tr -d '#' | tr '[:lower:]' '[:upper:]')
+  
+  # If we couldn't get enough colors, try the second method
+  if [ "$(echo "$COLORS" | wc -l)" -lt "$NUM_COLORS" ]; then
+    log_message "Method 1 didn't extract enough colors, trying method 2"
+    
+    # Method 2: Use quantization with higher saturation
+    COLORS=$(convert "$ENHANCED_ART" -resize 100x100 -colors "$NUM_COLORS" \
+      -unique-colors txt:- | grep -v "^#" | grep -oE '#[0-9A-F]{6}' | \
+      tr -d '#' | tr '[:lower:]' '[:upper:]')
+  fi
+  
+  # Check for color diversity and generate additional colors if needed
+  if [ "$(echo "$COLORS" | wc -l)" -lt "$NUM_COLORS" ]; then
+    COLORS=$(ensure_color_diversity "$COLORS" "$NUM_COLORS")
+  fi
+  
+  # Clean up temp file
+  rm -f "$ENHANCED_ART" 2>/dev/null
+  
+  echo "$COLORS"
+}
+
+# Helper function to ensure color diversity
+ensure_color_diversity() {
+  local COLORS="$1"
+  local TARGET_COUNT="$2"
+  local RESULT_COLORS="$COLORS"
+  
+  # For each color we need to add
+  while [ "$(echo "$RESULT_COLORS" | wc -l)" -lt "$TARGET_COUNT" ]; do
+    # Get the first color as a base
+    local BASE_COLOR=$(echo "$COLORS" | head -n 1)
+    
+    # Generate a contrasting color by inverting
+    if [ -n "$BASE_COLOR" ]; then
+      local R=$(echo "ibase=16; ${BASE_COLOR:0:2}" | bc)
+      local G=$(echo "ibase=16; ${BASE_COLOR:2:2}" | bc)
+      local B=$(echo "ibase=16; ${BASE_COLOR:4:2}" | bc)
+      
+      # Invert and adjust
+      R=$((255 - R))
+      G=$((255 - G))
+      B=$((255 - B))
+      
+      # Convert back to hex
+      local CONTRASTING_COLOR=$(printf "%02X%02x%02X" $R $G $B)
+      
+      # Add to the result
+      RESULT_COLORS="$RESULT_COLORS
+$CONTRASTING_COLOR"
+    else
+      # If no base color, add a default
+      RESULT_COLORS="$RESULT_COLORS
+FF0000"
+    fi
+  done
+  
+  echo "$RESULT_COLORS"
+}
+
+# Function to calculate BPM-based delay
+calculate_bpm_delay() {
+  local BPM="$1"
+  local DELAY="$ALTERNATION_DELAY"  # Default
+  
+  if [ -n "$BPM" ] && [ "$BPM" -gt 0 ]; then
+    # Map BPM to a delay between MIN_BPM_DELAY and MAX_BPM_DELAY
+    # Higher BPM = faster color changes (smaller delay)
+    
+    # Clamp BPM to our scale range
+    if [ "$BPM" -lt "$BPM_SCALE_MIN" ]; then
+      BPM=$BPM_SCALE_MIN
+    elif [ "$BPM" -gt "$BPM_SCALE_MAX" ]; then
+      BPM=$BPM_SCALE_MAX
+    fi
+    
+    # Calculate normalized position in the BPM range (0.0 to 1.0)
+    local BPM_RANGE=$((BPM_SCALE_MAX - BPM_SCALE_MIN))
+    local NORMALIZED=$(echo "scale=6; ($BPM - $BPM_SCALE_MIN) / $BPM_RANGE" | bc)
+    
+    # Invert so higher BPM = smaller delay
+    local INVERTED=$(echo "scale=6; 1.0 - $NORMALIZED" | bc)
+    
+    # Map to delay range
+    local DELAY_RANGE=$(echo "scale=6; $MAX_BPM_DELAY - $MIN_BPM_DELAY" | bc)
+    DELAY=$(echo "scale=3; $MIN_BPM_DELAY + ($INVERTED * $DELAY_RANGE)" | bc)
+    
+    log_message "BPM $BPM maps to delay: ${DELAY}s"
+  else
+    log_message "No valid BPM, using default delay: ${DELAY}s"
+  fi
+  
+  echo "$DELAY"
+}
+
+# Load environment and initialize
+load_environment
 
 # Configuration variables - use environment variables or defaults
 POLL_INTERVAL=${POLL_INTERVAL:-2}  # Main polling interval for checking media players
@@ -43,32 +224,23 @@ SAFE_MODE=${SAFE_MODE:-true}  # Enable safe mode for bulbs (slower, more reliabl
 # How long to wait between color changes when the bulb is in safe mode
 SAFE_MODE_WAIT=${SAFE_MODE_WAIT:-0.2}  # Add a small delay between color API calls
 
+# Near the other configuration variables
+MIN_COLOR_BRIGHTNESS=${MIN_COLOR_BRIGHTNESS:-25}  # Minimum RGB value to ensure colors are visible on bulb
+MIN_COLOR_SATURATION=${MIN_COLOR_SATURATION:-35}  # Minimum saturation percentage to ensure vibrant colors
+VIVID_COLOR_BOOST=${VIVID_COLOR_BOOST:-1.3}       # Saturation boost factor for making colors more vivid
+
+# Add these configuration variables
+COLOR_DIVERSITY_THRESHOLD=${COLOR_DIVERSITY_THRESHOLD:-50}  # How different colors should be from each other
+FORCE_HUE_ROTATION=${FORCE_HUE_ROTATION:-true}             # Force at least one color to have a different hue
+
 # For debugging
 log_message "Starting with NUM_COLORS=$NUM_COLORS and COLOR_INDEX=$COLOR_INDEX"
 log_message "BPM delay range: ${MIN_BPM_DELAY}s - ${MAX_BPM_DELAY}s, BPM scale: ${BPM_SCALE_MIN} - ${BPM_SCALE_MAX}"
 log_message "Safe mode: $SAFE_MODE, Safe mode wait: ${SAFE_MODE_WAIT}s"
 
-# Check if required variables are set
-if [ -z "$WEBHOOK_URL" ]; then
-  echo "Error: WEBHOOK_URL not defined in .env file"
-  echo "$(date '+%H:%M:%S') ERROR: WEBHOOK_URL not defined in .env file" >> /tmp/mpris_rgb_debug.log
-  exit 1
-fi
-
-if [ -z "$MUSIC_DIR" ]; then
-  echo "Error: MUSIC_DIR not defined in .env file"
-  echo "$(date '+%H:%M:%S') ERROR: MUSIC_DIR not defined in .env file" >> /tmp/mpris_rgb_debug.log
-  exit 1
-fi
-
-# Create temp directory
-mkdir -p "$TEMP_DIR"
-if [ ! -d "$TEMP_DIR" ]; then
-  echo "Error: Failed to create temporary directory $TEMP_DIR"
-  echo "$(date '+%H:%M:%S') ERROR: Failed to create temporary directory $TEMP_DIR" >> /tmp/mpris_rgb_debug.log
-  exit 1
-fi
-echo "$(date '+%H:%M:%S') Using temporary directory: $TEMP_DIR" >> /tmp/mpris_rgb_debug.log
+# Validate environment variables and initialize directories
+validate_requirements
+initialize_directories
 
 # Variable to store last track ID
 LAST_TRACK_ID=""
@@ -191,6 +363,9 @@ get_track_bpm() {
   
   # Use our get_bpm function for BPM detection
   BPM=$(get_bpm "$TITLE" "$ARTIST" "$TRACK_ID" "$IS_LOCAL_FILE")
+  
+  # Clean the BPM value to ensure it's just a number
+  BPM=$(echo "$BPM" | grep -o '^[0-9.]*$')
   
   # Validate BPM is a number
   if ! [[ "$BPM" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
@@ -320,6 +495,9 @@ declare -A LAST_LOGGED_STATUS
 
 # Background color alternation process ID
 COLOR_ALTERNATION_PID=""
+
+# Track which player the current color alternation is associated with
+COLORS_SOURCE_PLAYER=""
 
 # Function to find a local music file based on artist and title
 find_music_file() {
@@ -520,6 +698,79 @@ should_reprocess_track() {
   return 0  # Should reprocess
 }
 
+# Function to ensure a color meets minimum brightness requirements
+ensure_minimum_brightness() {
+  local R="$1"
+  local G="$2"
+  local B="$3"
+  
+  # Calculate average brightness
+  local BRIGHTNESS=$(( (R + G + B) / 3 ))
+  
+  # If brightness is below threshold, scale up all components
+  if [ "$BRIGHTNESS" -lt "$MIN_COLOR_BRIGHTNESS" ]; then
+    local SCALE_FACTOR=$(echo "scale=2; $MIN_COLOR_BRIGHTNESS / ($BRIGHTNESS + 1)" | bc)
+    
+    # Scale each component up while preserving color relationships
+    R=$(echo "scale=0; $R * $SCALE_FACTOR + 0.5" | bc | awk '{printf "%d", $1}')
+    G=$(echo "scale=0; $G * $SCALE_FACTOR + 0.5" | bc | awk '{printf "%d", $1}')
+    B=$(echo "scale=0; $B * $SCALE_FACTOR + 0.5" | bc | awk '{printf "%d", $1}')
+    
+    # Ensure values are capped at 255
+    R=$(( R > 255 ? 255 : (R < 0 ? 0 : R) ))
+    G=$(( G > 255 ? 255 : (G < 0 ? 0 : G) ))
+    B=$(( B > 255 ? 255 : (B < 0 ? 0 : B) ))
+    
+    # Fix the printf error by using stderr for logging
+    log_message "Adjusted dark color to meet minimum brightness (original brightness: $BRIGHTNESS)" >&2
+  fi
+  
+  # Enhance saturation to make colors more vivid
+  local MAX_VAL=$(( R > G ? (R > B ? R : B) : (G > B ? G : B) ))
+  local MIN_VAL=$(( R < G ? (R < B ? R : B) : (G < B ? G : B) ))
+  
+  # Calculate the current saturation (0-100%)
+  local SATURATION=0
+  if [ "$MAX_VAL" -gt 0 ]; then
+    SATURATION=$(( 100 * (MAX_VAL - MIN_VAL) / MAX_VAL ))
+  fi
+  
+  # If saturation is below minimum, boost it
+  if [ "$SATURATION" -lt "$MIN_COLOR_SATURATION" ] && [ "$MAX_VAL" -gt 0 ]; then
+    # Calculate the amount to boost each component
+    local DELTA=$(( MAX_VAL - MIN_VAL ))
+    
+    # Increase the delta to boost saturation
+    local BOOSTED_DELTA=$(echo "scale=2; $DELTA * $VIVID_COLOR_BOOST" | bc)
+    
+    # Apply proportional adjustment to each component
+    if [ "$MAX_VAL" -eq "$R" ]; then
+      # R is max, adjust G and B down
+      G=$(echo "scale=0; $MAX_VAL - ($MAX_VAL - $G) * $VIVID_COLOR_BOOST" | bc | awk '{printf "%d", $1}')
+      B=$(echo "scale=0; $MAX_VAL - ($MAX_VAL - $B) * $VIVID_COLOR_BOOST" | bc | awk '{printf "%d", $1}')
+    elif [ "$MAX_VAL" -eq "$G" ]; then
+      # G is max, adjust R and B down
+      R=$(echo "scale=0; $MAX_VAL - ($MAX_VAL - $R) * $VIVID_COLOR_BOOST" | bc | awk '{printf "%d", $1}')
+      B=$(echo "scale=0; $MAX_VAL - ($MAX_VAL - $B) * $VIVID_COLOR_BOOST" | bc | awk '{printf "%d", $1}')
+    else
+      # B is max, adjust R and G down
+      R=$(echo "scale=0; $MAX_VAL - ($MAX_VAL - $R) * $VIVID_COLOR_BOOST" | bc | awk '{printf "%d", $1}')
+      G=$(echo "scale=0; $MAX_VAL - ($MAX_VAL - $G) * $VIVID_COLOR_BOOST" | bc | awk '{printf "%d", $1}')
+    fi
+    
+    # Ensure all values are in valid range
+    R=$(( R > 255 ? 255 : (R < 0 ? 0 : R) ))
+    G=$(( G > 255 ? 255 : (G < 0 ? 0 : G) ))
+    B=$(( B > 255 ? 255 : (B < 0 ? 0 : B) ))
+    
+    # Log to stderr to avoid capturing in the function output
+    log_message "Boosted color saturation from $SATURATION% (RGB: $1,$2,$3 to RGB: $R,$G,$B)" >&2
+  fi
+  
+  # Return ONLY the RGB values, no logging in the output
+  echo "$R,$G,$B"
+}
+
 # Function to alternate colors in the background
 alternate_colors_background() {
   local DELAY="$1"
@@ -531,7 +782,14 @@ alternate_colors_background() {
   local LAST_TRACK_NAME="$8"
   local TRANSITION="${9:-1.0}"  # Default transition time if not provided
   
-  log_message "Starting background color alternation with $NUM_CACHED_COLORS colors and delay $DELAY"
+  # Store the source player name globally to check when resuming
+  # Extract just the player name without any extra text
+  COLORS_SOURCE_PLAYER=$(echo "$LAST_PLAYER_NAME" | sed 's/ (local file)$//' | sed 's/ .*$//')
+  
+  # Store this in a file to persist between script restarts
+  echo "$COLORS_SOURCE_PLAYER" > "/tmp/mpris_rgb_source_player"
+  
+  log_message "Starting background color alternation with $NUM_CACHED_COLORS colors and delay $DELAY for player: $COLORS_SOURCE_PLAYER"
   
   # Log all colors we're using
   log_message "Using colors for alternation:"
@@ -559,8 +817,36 @@ alternate_colors_background() {
     CG=$(( CG > 255 ? 255 : (CG < 0 ? 0 : CG) ))
     CB=$(( CB > 255 ? 255 : (CB < 0 ? 0 : CB) ))
     
-    # Update the array
-    COLORS_ARRAY[$i]="$CR,$CG,$CB"
+    # Apply minimum brightness adjustment - capture only the return value
+    ADJUSTED_COLOR=$(ensure_minimum_brightness "$CR" "$CG" "$CB")
+    
+    # Parse the adjusted color values
+    IFS=',' read -r NEW_R NEW_G NEW_B <<< "$ADJUSTED_COLOR"
+    
+    # Validate values again to be safe
+    NEW_R=$(echo "$NEW_R" | grep -o '[0-9]*' | head -1)
+    NEW_G=$(echo "$NEW_G" | grep -o '[0-9]*' | head -1)
+    NEW_B=$(echo "$NEW_B" | grep -o '[0-9]*' | head -1)
+    
+    # Set defaults if invalid
+    [ -z "$NEW_R" ] && NEW_R=30
+    [ -z "$NEW_G" ] && NEW_G=30
+    [ -z "$NEW_B" ] && NEW_B=30
+    
+    # Ensure values are in valid range 
+    NEW_R=$(( NEW_R > 255 ? 255 : (NEW_R < 0 ? 0 : NEW_R) ))
+    NEW_G=$(( NEW_G > 255 ? 255 : (NEW_G < 0 ? 0 : NEW_G) ))
+    NEW_B=$(( NEW_B > 255 ? 255 : (NEW_B < 0 ? 0 : NEW_B) ))
+    
+    # Update the array with the validated values
+    COLORS_ARRAY[$i]="$NEW_R,$NEW_G,$NEW_B"
+  done
+  
+  # Log colors after adjustment
+  log_message "Colors after brightness adjustment:"
+  for ((i=0; i<$NUM_CACHED_COLORS; i++)); do
+    IFS=',' read -r CR CG CB <<< "${COLORS_ARRAY[$i]}"
+    log_message "   Color $((i+1)): RGB($CR,$CG,$CB) - Hex: #$(printf '%02x%02x%02x' $CR $CG $CB)"
   done
   
   # Make sure transition is a simple numeric value 
@@ -584,7 +870,6 @@ alternate_colors_background() {
   local LAST_USED_COLOR=""
   local RETRIES=0
   local MAX_RETRIES=3
-  local CALL_COUNT=0
   
   # Continuously alternate colors at the specified delay
   while true; do
@@ -643,13 +928,6 @@ alternate_colors_background() {
     # Prepare payload with fixed transition time
     PAYLOAD="{\"rgb\": [$R, $G, $B], \"transition\": $TRANSITION_FORMATTED}"
     
-    # Log every 10th color change to reduce log spam
-    CALL_COUNT=$((CALL_COUNT + 1))
-    if (( CALL_COUNT % 10 == 0 )); then
-      log_message "Sending color: RGB($R,$G,$B) - Index: $NEXT_INDEX"
-      log_message "JSON Payload: $PAYLOAD"
-    fi
-    
     # Send to Home Assistant webhook with reduced logging
     curl -s -X POST \
       -H "Content-Type: application/json" \
@@ -686,7 +964,6 @@ alternate_colors_background() {
 # Function to pause background color alternation
 pause_background_alternation() {
   if [ -n "$COLOR_ALTERNATION_PID" ] && [ ! -f "/tmp/mpris_rgb_pause_alternation" ]; then
-    log_message "Pausing color alternation"
     touch "/tmp/mpris_rgb_pause_alternation"
   fi
 }
@@ -694,7 +971,6 @@ pause_background_alternation() {
 # Function to resume background color alternation
 resume_background_alternation() {
   if [ -n "$COLOR_ALTERNATION_PID" ] && [ -f "/tmp/mpris_rgb_pause_alternation" ]; then
-    log_message "Resuming color alternation"
     rm -f "/tmp/mpris_rgb_pause_alternation"
   fi
 }
@@ -1145,6 +1421,75 @@ process_artwork() {
     fi
   done
   
+  # After extracting colors but before applying minimum brightness, ensure diversity
+  if [ "$FORCE_HUE_ROTATION" = "true" ]; then
+    log_message "Enforcing color diversity with hue rotation..."
+    
+    # Get the primary color with the highest saturation
+    PRIMARY_COLOR="${FINAL_COLORS[0]}"
+    
+    # Create new diverse colors array
+    DIVERSE_COLORS=($(ensure_color_diversity "${FINAL_COLORS[@]}"))
+    
+    # Replace the colors with the diverse set
+    for ((i=0; i<$NUM_COLORS && i<${#DIVERSE_COLORS[@]}; i++)); do
+      FINAL_COLORS[$i]="${DIVERSE_COLORS[$i]}"
+    done
+    
+    log_message "Colors after diversity enforcement:"
+    for ((i=0; i<$NUM_COLORS; i++)); do
+      IFS=',' read -r R G B <<< "${FINAL_COLORS[$i]}"
+      log_message "   Color $((i+1)): RGB($R,$G,$B) - Hex: #$(printf '%02x%02x%02x' $R $G $B)"
+    done
+  fi
+  
+  # After extracting colors, before starting color alternation, apply minimum brightness
+  for ((i=0; i<$NUM_COLORS; i++)); do
+    if [ -n "${FINAL_COLORS[$i]}" ]; then
+      IFS=',' read -r R G B <<< "${FINAL_COLORS[$i]}"
+      
+      # Validate numeric values
+      R=$(echo "$R" | grep -o '[0-9]*' | head -1)
+      G=$(echo "$G" | grep -o '[0-9]*' | head -1)
+      B=$(echo "$B" | grep -o '[0-9]*' | head -1)
+      
+      # Set defaults if invalid
+      [ -z "$R" ] && R=30
+      [ -z "$G" ] && G=30
+      [ -z "$B" ] && B=30
+      
+      # Apply minimum brightness adjustment - capture only the return value
+      ADJUSTED_COLOR=$(ensure_minimum_brightness "$R" "$G" "$B")
+      
+      # Parse the adjusted color values 
+      IFS=',' read -r NEW_R NEW_G NEW_B <<< "$ADJUSTED_COLOR"
+      
+      # Validate values again
+      NEW_R=$(echo "$NEW_R" | grep -o '[0-9]*' | head -1)
+      NEW_G=$(echo "$NEW_G" | grep -o '[0-9]*' | head -1)
+      NEW_B=$(echo "$NEW_B" | grep -o '[0-9]*' | head -1)
+      
+      # Set defaults if invalid
+      [ -z "$NEW_R" ] && NEW_R=30
+      [ -z "$NEW_G" ] && NEW_G=30
+      [ -z "$NEW_B" ] && NEW_B=30
+      
+      # Safe range
+      NEW_R=$(( NEW_R > 255 ? 255 : (NEW_R < 30 ? 30 : NEW_R) ))
+      NEW_G=$(( NEW_G > 255 ? 255 : (NEW_G < 30 ? 30 : NEW_G) ))
+      NEW_B=$(( NEW_B > 255 ? 255 : (NEW_B < 30 ? 30 : NEW_B) ))
+      
+      FINAL_COLORS[$i]="$NEW_R,$NEW_G,$NEW_B"
+    fi
+  done
+  
+  # Log the brightness-adjusted colors
+  log_message "Colors after brightness adjustment:"
+  for ((i=0; i<$NUM_COLORS; i++)); do
+    IFS=',' read -r R G B <<< "${FINAL_COLORS[$i]}"
+    log_message "   Color $((i+1)): RGB($R,$G,$B) - Hex: #$(printf '%02x%02x%02x' $R $G $B)"
+  done
+  
   # Start background color alternation if enabled
   if [ $NUM_COLORS -gt 1 ]; then
     # Get BPM for the track to calculate color alternation timing
@@ -1211,117 +1556,70 @@ get_bpm() {
   local ARTIST="$2"
   local TRACK_ID="$3"
   local IS_LOCAL_FILE="$4"
+  local BPM=0
   
-  local BPM=0  # Default value if we can't determine BPM
+  # Create cache key (artist + title)
+  local CACHE_KEY="${ARTIST}-${TITLE}"
+  local CACHE_FILE="$BPM_CACHE_DIR/$(echo "$CACHE_KEY" | md5sum | cut -d' ' -f1).bpm"
   
-  # Step 1: Check cache first
-  local CACHE_KEY="${ARTIST}_${TITLE}"
-  CACHE_KEY=$(echo "$CACHE_KEY" | tr -cd '[:alnum:]_-')  # Sanitize for filename
-  local CACHE_FILE="${BPM_CACHE_DIR}/${CACHE_KEY}"
-  
-  if [ -f "$CACHE_FILE" ]; then
-    BPM=$(cat "$CACHE_FILE")
-    # Validate BPM from cache is a number
-    if [[ "$BPM" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-      >&2 log_message "Using cached BPM: $BPM"
+  # Check if we have cached BPM
+  if [[ -f "$CACHE_FILE" ]]; then
+    BPM=$(cat "$CACHE_FILE" | grep -o '^[0-9.]*$')
+    if [[ -n "$BPM" ]]; then
+      log_message "Found cached BPM: $BPM for $ARTIST - $TITLE"
       echo "$BPM"
       return
     else
-      >&2 log_message "Invalid cached BPM value: '$BPM', ignoring cache"
-      BPM=0
+      log_message "Found invalid cached BPM data, will refresh"
     fi
   fi
   
-  # Step 2: Try web lookup
-  if [ -n "$ARTIST" ] && [ -n "$TITLE" ]; then
-    # Clean up title and artist for search
-    local SEARCH_TITLE=$(echo "$TITLE" | sed 's/[()[\]{}]/ /g' | tr -cd '[:alnum:] -')
-    local SEARCH_ARTIST=$(echo "$ARTIST" | sed 's/[()[\]{}]/ /g' | tr -cd '[:alnum:] -')
+  # If it's a local file, try to extract BPM from the file itself
+  if [[ "$IS_LOCAL_FILE" == "true" ]]; then
+    log_message "Attempting to get BPM from local file"
     
-    # Use Python scraper if available
-    if command -v python3 >/dev/null && [ -f "$SCRIPT_DIR/bpm_web_lookup.py" ]; then
-      >&2 log_message "Attempting to get BPM from web using Python"
-      BPM=$(python3 "$SCRIPT_DIR/bpm_web_lookup.py" "$SEARCH_ARTIST" "$SEARCH_TITLE" 2>/dev/null)
+    # Find the local music file
+    local MUSIC_FILE=$(find_music_file "$ARTIST" "$TITLE" "$TITLE" "")
+    
+    if [[ -n "$MUSIC_FILE" ]]; then
+      log_message "Found local music file: $MUSIC_FILE"
+      # Extract BPM from the MP3 file
+      BPM=$(get_bpm_from_mp3 "$MUSIC_FILE")
       
-      # Validate BPM is a number
-      if [[ -n "$BPM" && "$BPM" =~ ^[0-9]+(\.[0-9]+)?$ && "$BPM" != "0" ]]; then
+      if [[ -n "$BPM" && "$BPM" -gt 0 ]]; then
+        log_message "Successfully extracted BPM from MP3: $BPM"
         # Save to cache
         mkdir -p "$BPM_CACHE_DIR"
         echo "$BPM" > "$CACHE_FILE"
-        >&2 log_message "Found BPM from web: $BPM"
         echo "$BPM"
         return
-      else
-        >&2 log_message "Web BPM lookup returned invalid value: '$BPM'"
-        BPM=0
       fi
     fi
   fi
   
-  # Step 3: For local files, try to get BPM directly from the MP3 file
-  if $IS_LOCAL_FILE; then
-    # Clean up title and artist for search (remove parentheses, etc.)
-    local SEARCH_TITLE=$(echo "$TITLE" | sed 's/[()[\]{}]/ /g')
-    local SEARCH_ARTIST=$(echo "$ARTIST" | sed 's/[()[\]{}]/ /g')
+  # Try to look up BPM online
+  log_message "Looking up BPM online for $ARTIST - $TITLE"
+  
+  # Use our Python script to look up BPM
+  local SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+  local BPM_LOOKUP_SCRIPT="$SCRIPT_DIR/bpm_web_lookup.py"
+  
+  if [[ -f "$BPM_LOOKUP_SCRIPT" ]]; then
+    # Redirect stderr to /dev/null and capture only the clean number output
+    BPM=$("$BPM_LOOKUP_SCRIPT" "$ARTIST" "$TITLE" 2>/dev/null | grep -o '^[0-9.]*$')
     
-    # Find music file path
-    local MUSIC_FILE=$(find_music_file "$SEARCH_ARTIST" "$SEARCH_TITLE" "$TITLE" "$ARTIST")
-    
-    if [ -n "$MUSIC_FILE" ]; then
-      >&2 log_message "Found local file for BPM extraction: $MUSIC_FILE"
-      BPM=$(get_bpm_from_mp3 "$MUSIC_FILE")
-      
-      # Validate BPM is a number
-      if [[ -n "$BPM" && "$BPM" =~ ^[0-9]+(\.[0-9]+)?$ && "$BPM" != "0" ]]; then
-        # Validate BPM is reasonable
-        if (( $(echo "$BPM < 20" | bc -l) )); then
-          >&2 log_message "Detected BPM from MP3 ($BPM) is unreasonably low, ignoring"
-          BPM=0
-        else
-          # Save to cache
-          mkdir -p "$BPM_CACHE_DIR"
-          echo "$BPM" > "$CACHE_FILE"
-          >&2 log_message "Found BPM from MP3 file: $BPM"
-          echo "$BPM"
-          return
-        fi
-      else
-        >&2 log_message "MP3 BPM extraction returned invalid value: '$BPM'"
-        BPM=0
-      fi
-    else
-      >&2 log_message "Could not find local MP3 file for BPM extraction"
+    if [[ -n "$BPM" && "$BPM" != "BPM not found" ]]; then
+      log_message "Found BPM online: $BPM"
+      # Save to cache
+      mkdir -p "$BPM_CACHE_DIR"
+      echo "$BPM" > "$CACHE_FILE"
+      echo "$BPM"
+      return
     fi
   fi
   
-  # Final fallback - if all methods fail, use a default BPM based on track title/artist hints
-  if [ "$BPM" = "0" ]; then
-    # Look for genre hints in artist name or title
-    if [[ "$TITLE" == *"Techno"* || "$TITLE" == *"EDM"* || 
-          "$TITLE" == *"House"* || "$TITLE" == *"Trance"* ]]; then
-      BPM=130  # Default for techno/dance music
-      >&2 log_message "Using genre-based default BPM: $BPM (Electronic/Techno)"
-    elif [[ "$TITLE" == *"Hip"* || "$TITLE" == *"Rap"* || "$TITLE" == *"Trap"* ]]; then
-      BPM=95  # Default for hip-hop
-      >&2 log_message "Using genre-based default BPM: $BPM (Hip-Hop/Rap)"
-    elif [[ "$TITLE" == *"Rock"* || "$TITLE" == *"Metal"* || "$TITLE" == *"Punk"* ]]; then
-      BPM=120  # Default for rock
-      >&2 log_message "Using genre-based default BPM: $BPM (Rock/Metal)"
-    elif [[ "$TITLE" == *"Ambient"* || "$TITLE" == *"Chill"* || "$TITLE" == *"Relax"* ]]; then
-      BPM=75  # Default for ambient/chill
-      >&2 log_message "Using genre-based default BPM: $BPM (Ambient/Chill)"
-    else
-      BPM=110  # General default 
-      >&2 log_message "All BPM detection methods failed, using general default BPM: $BPM"
-    fi
-  fi
-  
-  # Final validation before returning
-  if ! [[ "$BPM" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-    >&2 log_message "Invalid BPM calculation result: '$BPM', defaulting to 0"
-    BPM=0
-  fi
-  
+  # If all methods failed, return default
+  log_message "Could not determine BPM, using default"
   echo "$BPM"
 }
 
@@ -1369,27 +1667,67 @@ generate_contrasting_color() {
   local METHOD="$4"  # 1=complement, 2=rotate hue, 3=rotate another way
   
   case $METHOD in
-    1) # Complementary color
-       echo "$((255-R)),$((255-G)),$((255-B))"
+    1) # Complementary color with increased saturation
+       local NEW_R=$((255-R))
+       local NEW_G=$((255-G))
+       local NEW_B=$((255-B))
+       # Boost saturation
+       echo "$(ensure_minimum_brightness "$NEW_R" "$NEW_G" "$NEW_B")"
        ;;
-    2) # Rotate hue (RGB -> GBR)
-       echo "$G,$B,$R"
+    2) # Rotate hue (RGB -> GBR) with increased vibrancy
+       echo "$(ensure_minimum_brightness "$G" "$B" "$R")"
        ;;
-    3) # Rotate hue another way (RGB -> BRG)
-       echo "$B,$R,$G"
+    3) # Rotate hue another way (RGB -> BRG) with increased vibrancy
+       echo "$(ensure_minimum_brightness "$B" "$R" "$G")"
        ;;
     4) # High contrast version
-       local NEW_R=$((R < 128 ? 255 : 0))
-       local NEW_G=$((G < 128 ? 255 : 0))
-       local NEW_B=$((B < 128 ? 255 : 0))
-       echo "$NEW_R,$NEW_G,$NEW_B"
+       local NEW_R=$((R < 128 ? 255 : 30))
+       local NEW_G=$((G < 128 ? 255 : 30))
+       local NEW_B=$((B < 128 ? 255 : 30))
+       echo "$(ensure_minimum_brightness "$NEW_R" "$NEW_G" "$NEW_B")"
        ;;
-    *) # Default to complementary
-       echo "$((255-R)),$((255-G)),$((255-B))"
+    *) # Default to complementary with increased vibrancy
+       local NEW_R=$((255-R))
+       local NEW_G=$((255-G))
+       local NEW_B=$((255-B))
+       echo "$(ensure_minimum_brightness "$NEW_R" "$NEW_G" "$NEW_B")"
        ;;
   esac
 }
 
+# Function to send a color to Home Assistant
+send_color() {
+  local R="$1"
+  local G="$2"
+  local B="$3"
+  local TRANSITION_TIME="${4:-1}"
+  
+  # Format the RGB color
+  local RGB="$R,$G,$B"
+  
+  # Skip if this is the same color as last time
+  if [[ "$R" == "$LAST_R" && "$G" == "$LAST_G" && "$B" == "$LAST_B" ]]; then
+    if [ "$VERBOSE_LOGGING" = "true" ]; then
+      log_message "Skipping duplicate color: $RGB"
+    fi
+    return
+  fi
+  
+  # Send the color via webhookoes
+  send_webhook_request "$RGB" "$TRANSITION_TIME"
+  
+  # Save the current RGB values
+  LAST_R="$R"
+  LAST_G="$G"
+  LAST_B="$B"
+}
+
+# Add these state tracking variables near the others at the top of the script
+LAST_ACTIVE_PLAYER=""
+LAST_SOURCE_PLAYER_PLAYING_STATE=""
+AUTO_SWITCH_PLAYERS=${AUTO_SWITCH_PLAYERS:-true}  # Add this new configuration variable
+
+# Modify the main loop to reduce redundant log messages
 while true; do
   # Get all player metadata
   PLAYERS=$(playerctl -l 2>/dev/null)
@@ -1400,6 +1738,14 @@ while true; do
   NEW_STATUS=false
   ARTWORK_UPDATED=false
   CURRENT_PAUSED_STATE=true  # Default to true until we find a playing player
+  ACTIVE_SOURCE_PLAYER_PLAYING=false  # Track if the source player is actively playing
+  ACTIVE_PLAYER=""  # Track which player is currently active
+  
+  # Read source player from file if not set in memory
+  if [ -z "$COLORS_SOURCE_PLAYER" ] && [ -f "/tmp/mpris_rgb_source_player" ]; then
+    COLORS_SOURCE_PLAYER=$(cat "/tmp/mpris_rgb_source_player")
+    log_message "Loaded source player from file: $COLORS_SOURCE_PLAYER"
+  fi
   
   if $FIRST_RUN; then
     log_message "Checking media players..."
@@ -1410,17 +1756,99 @@ while true; do
   # This avoids multiple pause/resume operations
   for PLAYER in $PLAYERS; do
     STATUS=$(playerctl -p "$PLAYER" status 2>/dev/null)
+    
+    if [ "$VERBOSE_LOGGING" = "true" ]; then
+      log_message "Checking player: $PLAYER - Status: $STATUS"
+    fi
+    
     if [[ -n "$STATUS" && "$STATUS" == "Playing" ]]; then
       CURRENT_PAUSED_STATE=false
-      break
+      ACTIVE_PLAYER="$PLAYER"
+      
+      # Check if this is the same player that the current colors are from
+      # More robust comparison using simple substring check
+      if [[ -n "$COLORS_SOURCE_PLAYER" && "$PLAYER" == *"$COLORS_SOURCE_PLAYER"* ]]; then
+        ACTIVE_SOURCE_PLAYER_PLAYING=true
+      fi
     fi
   done
   
-  # Apply pause/resume once based on overall state
+  # Only log player detection when the state changes
+  PLAYER_STATE_CHANGED=false
+  
+  # Check if active player changed
+  if [[ "$ACTIVE_PLAYER" != "$LAST_ACTIVE_PLAYER" ]]; then
+    PLAYER_STATE_CHANGED=true
+    LAST_ACTIVE_PLAYER="$ACTIVE_PLAYER"
+  fi
+  
+  # Check if source player playing state changed
+  CURRENT_SOURCE_PLAYER_STATE="$ACTIVE_SOURCE_PLAYER_PLAYING"
+  if [[ "$CURRENT_SOURCE_PLAYER_STATE" != "$LAST_SOURCE_PLAYER_PLAYING_STATE" ]]; then
+    PLAYER_STATE_CHANGED=true
+    LAST_SOURCE_PLAYER_PLAYING_STATE="$CURRENT_SOURCE_PLAYER_STATE"
+  fi
+  
+  # Log player status only when something changes
+  if [[ "$PLAYER_STATE_CHANGED" = true && -n "$ACTIVE_PLAYER" ]]; then
+    # Check if the active player is in the ignored list
+    IS_IGNORED_PLAYER=false
+    if [[ "$ACTIVE_PLAYER" == *"haruna"* || 
+          "$ACTIVE_PLAYER" == *"vlc"* || 
+          "$ACTIVE_PLAYER" == *"mpv"* || 
+          "$ACTIVE_PLAYER" == *"celluloid"* || 
+          "$ACTIVE_PLAYER" == *"totem"* || 
+          "$ACTIVE_PLAYER" == *"kdeconnect"* ]]; then
+      IS_IGNORED_PLAYER=true
+    fi
+
+    if $ACTIVE_SOURCE_PLAYER_PLAYING; then
+      log_message "Source player '$COLORS_SOURCE_PLAYER' is playing - resuming color rotation (matched with '$ACTIVE_PLAYER')"
+    elif [[ -n "$COLORS_SOURCE_PLAYER" && "$AUTO_SWITCH_PLAYERS" = "true" && -n "$ACTIVE_PLAYER" && "$IS_IGNORED_PLAYER" = "false" ]]; then
+      log_message "Different player '$ACTIVE_PLAYER' is playing - automatically switching to new player"
+      # We'll let the normal processing handle the player switch
+      # This ensures we get its artwork and process it correctly
+    elif [[ -n "$COLORS_SOURCE_PLAYER" ]]; then
+      log_message "Different player '$ACTIVE_PLAYER' is playing while colors are from '$COLORS_SOURCE_PLAYER' - keeping colors paused"
+    fi
+  fi
+  
+  # Apply pause/resume based on if the source player is playing
   if [ "$CURRENT_PAUSED_STATE" = true ]; then
+    # Check if we need to log the pause action
+    if [[ "$PLAYER_STATE_CHANGED" = true || "$LAST_SOURCE_PLAYER_PLAYING_STATE" = "true" ]]; then
+      log_message "Pausing color alternation (no players playing)"
+    fi
     pause_background_alternation
-  else
+  elif [ "$ACTIVE_SOURCE_PLAYER_PLAYING" = true ]; then
+    # Only resume color alternation if the source player is playing
     resume_background_alternation
+  elif [[ "$AUTO_SWITCH_PLAYERS" = "true" && -n "$ACTIVE_PLAYER" ]]; then
+    # Need to check if this is an ignored player before resetting the source player
+    IS_IGNORED_PLAYER=false
+    if [[ "$ACTIVE_PLAYER" == *"haruna"* || 
+          "$ACTIVE_PLAYER" == *"vlc"* || 
+          "$ACTIVE_PLAYER" == *"mpv"* || 
+          "$ACTIVE_PLAYER" == *"celluloid"* || 
+          "$ACTIVE_PLAYER" == *"totem"* || 
+          "$ACTIVE_PLAYER" == *"kdeconnect"* ]]; then
+      IS_IGNORED_PLAYER=true
+    fi
+    
+    # Only reset source player and switch if this is not an ignored player
+    if [ "$IS_IGNORED_PLAYER" = "false" ]; then
+      # If auto-switching is enabled and there's a different active player,
+      # we'll reset the source player and process the new active player's artwork in the next cycle
+      COLORS_SOURCE_PLAYER=""
+      # Remove the file to ensure consistency
+      rm -f "/tmp/mpris_rgb_source_player" 2>/dev/null
+    fi
+
+    # Only log when state changes
+    if [[ "$PLAYER_STATE_CHANGED" = true ]]; then
+      log_message "Pausing color alternation (wrong player active)"
+    fi
+    pause_background_alternation
   fi
   
   # First pass - check if Spotify is playing and has artwork

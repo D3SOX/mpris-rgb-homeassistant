@@ -8,22 +8,53 @@ import json
 import time
 import sqlite3
 import os
+import logging
+from typing import Optional, Dict, Any, List, Tuple
 
-# Add debug flag to control output verbosity
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stderr)]
+)
+logger = logging.getLogger("bpm_lookup")
+
+# Config
+DB_FILE = "known_bpms.sqlite"
 DEBUG = False  # Set to True for verbose debugging output
 
-# Helper function to print only when debugging is enabled
-def debug_print(*args, **kwargs):
-    if DEBUG:
-        print(*args, **kwargs)
+# Set log level based on debug flag
+if DEBUG:
+    logger.setLevel(logging.DEBUG)
+else:
+    logger.setLevel(logging.CRITICAL)
 
-# Initialize SQLite database for storing known BPMs
-DB_FILE = "known_bpms.sqlite"
+# API endpoints and URL templates
+ENDPOINTS = {
+    'tunebat_api': 'https://api.tunebat.com/api/tracks/search?term={query}',
+    'songbpm_format1': 'https://songbpm.com/@{artist}/{track}',
+    'songbpm_format2': 'https://songbpm.com/{artist}/{track}',
+    'tunebat_format1': 'https://tunebat.com/Info/{track}-{artist}',
+    'tunebat_format2': 'https://tunebat.com/Info/{artist}-{track}',
+    'tunebat_format3': 'https://tunebat.com/Info/{track}/{artist}',
+    'tunebat_format4': 'https://tunebat.com/Info/{track}-by-{artist}'
+}
 
-def init_database():
+# Common HTTP headers
+DEFAULT_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.5',
+    'DNT': '1',
+    'Connection': 'keep-alive',
+    'Upgrade-Insecure-Requests': '1',
+    'Cache-Control': 'max-age=0'
+}
+
+def init_database() -> None:
     """Initialize the SQLite database if it doesn't exist"""
     if not os.path.exists(DB_FILE):
-        print(f"Creating new BPM database at {DB_FILE}")
+        logger.info(f"Creating new BPM database at {DB_FILE}")
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
         
@@ -42,190 +73,240 @@ def init_database():
         
         conn.commit()
         conn.close()
-        print(f"Database initialized")
+        logger.info(f"Database initialized")
 
-def get_bpm_from_songbpm(artist, track):
+def make_http_request(url: str, headers: Dict = None, is_json: bool = False) -> Optional[Tuple[int, Any]]:
+    """
+    Make an HTTP request and return the response.
+    
+    Args:
+        url: URL to request
+        headers: Optional headers dictionary
+        is_json: Whether to expect a JSON response
+        
+    Returns:
+        Tuple of (status_code, content) where content is either text or parsed JSON
+    """
+    if headers is None:
+        headers = DEFAULT_HEADERS
+    
+    try:
+        logger.debug(f"Making request to: {url}")
+        response = requests.get(url, headers=headers)
+        logger.debug(f"Status code: {response.status_code}")
+        
+        if response.status_code == 200:
+            if is_json:
+                try:
+                    return response.status_code, response.json()
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Failed to parse JSON: {e}")
+                    return response.status_code, response.text
+            return response.status_code, response.text
+        elif response.status_code == 429:  # Too Many Requests
+            logger.warning("Rate limited by the server")
+            if 'Retry-After' in response.headers:
+                retry_after = int(response.headers['Retry-After'])
+                logger.info(f"Need to wait {retry_after} seconds before retrying")
+            return response.status_code, None
+        else:
+            logger.warning(f"Request failed with status code: {response.status_code}")
+            return response.status_code, None
+    
+    except Exception as e:
+        logger.error(f"Error making request: {e}")
+        return None, None
+
+def extract_bpm_from_html(html_content: str) -> Optional[str]:
+    """
+    Extract BPM value from HTML using various methods.
+    
+    Args:
+        html_content: HTML content to parse
+        
+    Returns:
+        BPM value as string if found, None otherwise
+    """
+    if not html_content:
+        return None
+    
+    soup = BeautifulSoup(html_content, 'html.parser')
+    
+    # Method 1: Look for the BPM directly in the HTML (main display)
+    bpm_element = soup.select_one('.bpm-value, h1 + div')
+    if bpm_element:
+        bpm_text = bpm_element.text.strip()
+        # Extract number from text like "117 BPM"
+        bpm_match = re.search(r'(\d+)', bpm_text)
+        if bpm_match:
+            return bpm_match.group(1)
+    
+    # Method 2: Look for BPM in song metrics section
+    metrics = soup.select('div.song-metrics, .song-metrics')
+    for metric in metrics:
+        if 'Tempo (BPM)' in metric.text:
+            bpm_text = metric.text
+            bpm_match = re.search(r'Tempo \(BPM\)[^\d]*(\d+)', bpm_text)
+            if bpm_match:
+                return bpm_match.group(1)
+    
+    # Method 3: Extract BPM from JSON-LD structured data
+    scripts = soup.find_all('script', {'type': 'application/ld+json'})
+    for script in scripts:
+        try:
+            data = json.loads(script.string)
+            if 'tempo' in data:
+                return str(data['tempo'])
+        except (json.JSONDecodeError, AttributeError):
+            continue
+    
+    # Method 4: Extract BPM from any text that looks like "123 BPM"
+    bpm_pattern = re.compile(r'(\d+)\s*BPM', re.IGNORECASE)
+    matches = bpm_pattern.findall(html_content)
+    if matches:
+        return matches[0]
+    
+    return None
+
+def check_known_bpms(artist: str, track: str) -> Optional[str]:
+    """Check if BPM is already known in the database"""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        
+        cursor.execute(
+            "SELECT bpm FROM known_bpms WHERE LOWER(artist) = LOWER(?) AND LOWER(track) = LOWER(?)",
+            (artist, track)
+        )
+        
+        result = cursor.fetchone()
+        conn.close()
+        
+        if result:
+            logger.debug(f"Found BPM in database: {result[0]}")
+            return result[0]
+            
+        logger.debug("BPM not found in database")
+        return None
+        
+    except Exception as e:
+        logger.error(f"Error checking database: {e}")
+        return None
+
+def save_bpm_to_db(artist: str, track: str, bpm: str, source: str) -> None:
+    """Save the BPM to the database"""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        
+        # Check if entry already exists
+        cursor.execute(
+            "SELECT id FROM known_bpms WHERE LOWER(artist) = LOWER(?) AND LOWER(track) = LOWER(?)",
+            (artist, track)
+        )
+        
+        if cursor.fetchone():
+            # Update existing entry
+            cursor.execute(
+                "UPDATE known_bpms SET bpm = ?, source = ?, timestamp = ? WHERE LOWER(artist) = LOWER(?) AND LOWER(track) = LOWER(?)",
+                (bpm, source, int(time.time()), artist, track)
+            )
+            logger.debug(f"Updated BPM in database: {bpm} for {artist} - {track}")
+        else:
+            # Insert new entry
+            cursor.execute(
+                "INSERT INTO known_bpms (artist, track, bpm, source, timestamp) VALUES (?, ?, ?, ?, ?)",
+                (artist, track, bpm, source, int(time.time()))
+            )
+            logger.debug(f"Saved BPM to database: {bpm} for {artist} - {track}")
+        
+        conn.commit()
+        conn.close()
+        
+    except Exception as e:
+        logger.error(f"Error saving to database: {e}")
+
+def get_bpm_from_songbpm(artist: str, track: str) -> Optional[str]:
     """Get track BPM by scraping songbpm.com"""
-    # Try multiple URL formats for songbpm.com
+    # Format parameters for URL
     artist_dash = artist.lower().replace(' ', '-')
     track_dash = track.lower().replace(' ', '-')
-    
-    # Replace spaces with '+' for alternative URL format
     artist_plus = artist.lower().replace(' ', '+')
     track_plus = track.lower().replace(' ', '+')
     
     urls = [
-        f"https://songbpm.com/@{artist_dash}/{track_dash}",
-        f"https://songbpm.com/{artist_plus}/{track_plus}"
+        ENDPOINTS['songbpm_format1'].format(artist=artist_dash, track=track_dash),
+        ENDPOINTS['songbpm_format2'].format(artist=artist_plus, track=track_plus)
     ]
     
-    # Add headers to simulate a browser
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-        'Referer': 'https://songbpm.com/',
-        'DNT': '1',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-        'Cache-Control': 'max-age=0'
-    }
-    
     for url in urls:
-        debug_print(f"Looking up BPM on songbpm.com: {url}")
+        logger.debug(f"Looking up BPM on songbpm.com: {url}")
+        status, content = make_http_request(url)
         
-        try:
-            response = requests.get(url, headers=headers)
-            debug_print(f"Status code: {response.status_code}")
-            
-            if response.status_code == 200:
-                # Parse the HTML
-                soup = BeautifulSoup(response.text, 'html.parser')
-                
-                # Method 1: Look for the BPM directly in the HTML (main display)
-                bpm_element = soup.select_one('.bpm-value, h1 + div')
-                if bpm_element:
-                    bpm_text = bpm_element.text.strip()
-                    # Extract number from text like "117 BPM"
-                    bpm_match = re.search(r'(\d+)', bpm_text)
-                    if bpm_match:
-                        bpm = bpm_match.group(1)
-                        debug_print(f"Found BPM in HTML: {bpm}")
-                        # Save to database
-                        save_bpm_to_db(artist, track, bpm, "songbpm")
-                        return bpm
-                
-                # Method 2: Look for BPM in song metrics section
-                metrics = soup.select('div.song-metrics, .song-metrics')
-                for metric in metrics:
-                    if 'Tempo (BPM)' in metric.text:
-                        bpm_text = metric.text
-                        bpm_match = re.search(r'Tempo \(BPM\)[^\d]*(\d+)', bpm_text)
-                        if bpm_match:
-                            bpm = bpm_match.group(1)
-                            debug_print(f"Found BPM in metrics: {bpm}")
-                            # Save to database
-                            save_bpm_to_db(artist, track, bpm, "songbpm")
-                            return bpm
-                
-                # Method 3: Extract BPM from JSON-LD structured data
-                scripts = soup.find_all('script', {'type': 'application/ld+json'})
-                for script in scripts:
-                    try:
-                        data = json.loads(script.string)
-                        if 'tempo' in data:
-                            bpm = data['tempo']
-                            debug_print(f"Found BPM in JSON-LD: {bpm}")
-                            # Save to database
-                            save_bpm_to_db(artist, track, bpm, "songbpm")
-                            return bpm
-                    except (json.JSONDecodeError, AttributeError):
-                        continue
-                
-                # Method 4: Extract BPM from any text that looks like "123 BPM"
-                bpm_pattern = re.compile(r'(\d+)\s*BPM', re.IGNORECASE)
-                matches = bpm_pattern.findall(response.text)
-                if matches:
-                    bpm = matches[0]
-                    debug_print(f"Found BPM using regex: {bpm}")
-                    # Save to database
-                    save_bpm_to_db(artist, track, bpm, "songbpm")
-                    return bpm
-                
-                debug_print("BPM not found on the page")
-            else:
-                debug_print(f"Failed to fetch data: HTTP {response.status_code}")
-        
-        except Exception as e:
-            debug_print(f"Error: {e}")
+        if status == 200 and content:
+            bpm = extract_bpm_from_html(content)
+            if bpm:
+                logger.debug(f"Found BPM on songbpm.com: {bpm}")
+                save_bpm_to_db(artist, track, bpm, "songbpm")
+                return bpm
     
-    debug_print("BPM not found on songbpm.com")
+    logger.debug("BPM not found on songbpm.com")
     return None
 
-def get_bpm_from_tunebat(artist, track):
+def get_bpm_from_tunebat_api(artist: str, track: str) -> Optional[str]:
     """Get track BPM by using the Tunebat API directly"""
-    debug_print(f"Looking up BPM on Tunebat API for: {artist} - {track}")
+    logger.debug(f"Looking up BPM on Tunebat API for: {artist} - {track}")
     
-    # Format the search query similar to the JS version
+    # Format the search query
     query = f"{artist} {track}"
     encoded_query = requests.utils.quote(query)
+    api_url = ENDPOINTS['tunebat_api'].format(query=encoded_query)
     
-    api_url = f"https://api.tunebat.com/api/tracks/search?term={encoded_query}"
+    # Use specific headers for API
+    api_headers = DEFAULT_HEADERS.copy()
+    api_headers['Accept'] = 'application/json'
+    api_headers['Referer'] = 'https://tunebat.com/'
     
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-        'Accept': 'application/json',
-        'Referer': 'https://tunebat.com/',
-    }
+    status, data = make_http_request(api_url, headers=api_headers, is_json=True)
     
-    try:
-        response = requests.get(api_url, headers=headers)
-        debug_print(f"API Status code: {response.status_code}")
-        
-        if response.status_code == 200:
-            # Try to parse the JSON response
+    if status == 200 and data:
+        # Handle both parsed JSON and text response
+        if isinstance(data, str):
             try:
-                # Normalize the response text as done in the JS version
-                normalized_text = response.text
-                data = json.loads(normalized_text)
-                
-                if 'data' in data and 'items' in data['data']:
-                    items = data['data']['items']
-                    
-                    if not items:
-                        debug_print("No results found in Tunebat API")
-                        return None
-                    
-                    # Find the best match (first result is usually the best)
-                    best_match = items[0]
-                    
-                    # Check if there's a better match by comparing artist and title
-                    for item in items:
-                        # In the JS code, 'as' contains artists and 'n' is the track title
-                        if artist.lower() in [a.lower() for a in item.get('as', [])] and \
-                           track.lower() == item.get('n', '').lower():
-                            best_match = item
-                            break
-                    
-                    # In the JS code, 'b' is the BPM field
-                    if 'b' in best_match:
-                        bpm = best_match['b']
-                        debug_print(f"Found BPM in Tunebat API: {bpm}")
-                        # Save to database
-                        save_bpm_to_db(artist, track, str(bpm), "tunebat_api")
-                        return str(bpm)
-                    else:
-                        debug_print("BPM field not found in the best match item")
-                
-                else:
-                    debug_print("Invalid response format from Tunebat API")
+                data = json.loads(data)
+            except json.JSONDecodeError:
+                logger.warning("Failed to parse Tunebat API response")
+                return None
+        
+        if 'data' in data and 'items' in data['data']:
+            items = data['data']['items']
             
-            except json.JSONDecodeError as e:
-                debug_print(f"Failed to parse Tunebat API response: {e}")
-                # If we get rate limited, we might need to wait
-                if 'Retry-After' in response.headers:
-                    retry_after = int(response.headers['Retry-After'])
-                    debug_print(f"Rate limited. Need to wait {retry_after} seconds before retrying")
-                    # Could implement retry logic here
-        
-        elif response.status_code == 429:  # Too Many Requests
-            debug_print("Rate limited by Tunebat API")
-            if 'Retry-After' in response.headers:
-                retry_after = int(response.headers['Retry-After'])
-                debug_print(f"Need to wait {retry_after} seconds before retrying")
-                # Could implement retry logic here
-        
-        else:
-            debug_print(f"Tunebat API request failed with status code: {response.status_code}")
+            if not items:
+                logger.debug("No results found in Tunebat API")
+                return None
+            
+            # Find the best match (first result is usually the best)
+            best_match = items[0]
+            
+            # Check if there's a better match by comparing artist and title
+            for item in items:
+                if artist.lower() in [a.lower() for a in item.get('as', [])] and \
+                   track.lower() == item.get('n', '').lower():
+                    best_match = item
+                    break
+            
+            # In the API response, 'b' is the BPM field
+            if 'b' in best_match:
+                bpm = str(best_match['b'])
+                logger.debug(f"Found BPM in Tunebat API: {bpm}")
+                save_bpm_to_db(artist, track, bpm, "tunebat_api")
+                return bpm
     
-    except Exception as e:
-        debug_print(f"Error with Tunebat API request: {e}")
-    
-    # Fallback to the web scraping method
-    debug_print("Falling back to web scraping method")
+    # Fallback to web scraping method
+    logger.debug("Falling back to web scraping method")
     return get_bpm_from_tunebat_web_scraping(artist, track)
 
-def get_bpm_from_tunebat_web_scraping(artist, track):
+def get_bpm_from_tunebat_web_scraping(artist: str, track: str) -> Optional[str]:
     """Get track BPM by scraping tunebat.com (fallback method)"""
     # Process the artist and track names
     artist_clean = artist.lower().replace(' ', '-')
@@ -235,202 +316,87 @@ def get_bpm_from_tunebat_web_scraping(artist, track):
     artist_clean = re.sub(r'[^\w\-]', '', artist_clean)
     track_clean = re.sub(r'[^\w\-]', '', track_clean)
     
-    # Try different URL formats - Tunebat often formats URLs as "Track-Artist"
+    # Try different URL formats
     urls = [
-        f"https://tunebat.com/Info/{track_clean}-{artist_clean}",
-        f"https://tunebat.com/Info/{artist_clean}-{track_clean}",
-        f"https://tunebat.com/Info/{track_clean}/{artist_clean}",
-        # Sometimes the URL includes the word "by" between track and artist
-        f"https://tunebat.com/Info/{track_clean}-by-{artist_clean}"
+        ENDPOINTS['tunebat_format1'].format(track=track_clean, artist=artist_clean),
+        ENDPOINTS['tunebat_format2'].format(track=track_clean, artist=artist_clean),
+        ENDPOINTS['tunebat_format3'].format(track=track_clean, artist=artist_clean),
+        ENDPOINTS['tunebat_format4'].format(track=track_clean, artist=artist_clean)
     ]
     
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-        'Referer': 'https://tunebat.com/',
-        'DNT': '1',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-        'Cache-Control': 'max-age=0'
-    }
-    
     for url in urls:
-        debug_print(f"Looking up BPM on tunebat.com: {url}")
+        logger.debug(f"Looking up BPM on tunebat.com: {url}")
+        status, content = make_http_request(url)
         
-        try:
-            response = requests.get(url, headers=headers)
-            debug_print(f"Status code: {response.status_code}")
-            
-            if response.status_code == 200:
-                # Save the HTML for debugging
-                with open("tunebat_response.html", "w", encoding="utf-8") as f:
-                    f.write(response.text)
-                
-                debug_print(f"Saved HTML response to tunebat_response.html")
-                
-                # Parse the HTML
-                soup = BeautifulSoup(response.text, 'html.parser')
-                
-                # Print the title to confirm we're on the right page
-                title = soup.title.text if soup.title else "No title found"
-                debug_print(f"Page title: {title}")
-                
-                # Method 1: Look for BPM in the attributes table
-                # Updated selector to be more specific and handle deprecated :contains
-                try:
-                    # First attempt - look for table rows containing "BPM"
-                    rows = soup.select('div.row.attribute')
-                    debug_print(f"Found {len(rows)} attribute rows")
-                    for row in rows:
-                        row_text = row.get_text()
-                        debug_print(f"Row text: {row_text}")
-                        if 'BPM' in row_text:
-                            # Found the BPM row, now extract the number
-                            value_element = row.select_one('div.attribute-value')
-                            if value_element:
-                                bpm = value_element.text.strip()
-                                debug_print(f"Found BPM on Tunebat: {bpm}")
-                                # Save to database
-                                save_bpm_to_db(artist, track, bpm, "tunebat_web")
-                                return bpm
-                except Exception as e:
-                    debug_print(f"Error with method 1: {e}")
-                
-                # Method 2: Try various CSS selectors that might contain the BPM
-                selectors = [
-                    '.attribute-value', 
-                    '.bpm-value', 
-                    '.tempo-value',
-                    '.bpm',
-                    '.tempo'
-                ]
-                
-                for selector in selectors:
-                    elements = soup.select(selector)
-                    debug_print(f"Selector '{selector}' found {len(elements)} elements")
-                    for element in elements:
-                        text = element.text.strip()
-                        debug_print(f"Element text: {text}")
-                        # Check if it looks like a BPM number (typically 60-200)
-                        if re.match(r'^\d+$', text) and 40 <= int(text) <= 220:
-                            debug_print(f"Found BPM using selector {selector}: {text}")
-                            # Save to database
-                            save_bpm_to_db(artist, track, text, "tunebat_web")
-                            return text
-                
-                # Method 3: Find any numbers near "BPM" text
-                # Look through all page text for patterns like "120 BPM" or "BPM: 120"
-                bpm_patterns = [
-                    r'(\d+)\s*BPM',  # "120 BPM"
-                    r'BPM\s*[:-]?\s*(\d+)',  # "BPM: 120" or "BPM - 120"
-                    r'tempo\s*[:-]?\s*(\d+)',  # "Tempo: 120"
-                    r'(\d+)\s*beats per minute'  # "120 beats per minute"
-                ]
-                
-                for pattern in bpm_patterns:
-                    matches = re.findall(pattern, response.text, re.IGNORECASE)
-                    if matches:
-                        debug_print(f"Pattern '{pattern}' found matches: {matches}")
-                        bpm = matches[0]
-                        debug_print(f"Found BPM using regex pattern {pattern}: {bpm}")
-                        # Save to database
-                        save_bpm_to_db(artist, track, bpm, "tunebat_web")
-                        return bpm
-            
-            else:
-                debug_print(f"Failed to fetch data from Tunebat: HTTP {response.status_code}")
-        
-        except Exception as e:
-            debug_print(f"Error with Tunebat URL {url}: {e}")
+        if status == 200 and content:
+            bpm = extract_bpm_from_html(content)
+            if bpm:
+                logger.debug(f"Found BPM on tunebat.com: {bpm}")
+                save_bpm_to_db(artist, track, bpm, "tunebat_web")
+                return bpm
     
-    debug_print("BPM not found on any Tunebat URL")
+    logger.debug("BPM not found on tunebat.com")
     return None
 
-def check_known_bpms(artist, track):
-    """Check database for known BPMs"""
-    init_database()  # Make sure database exists
+def get_track_bpm(artist: str, track: str) -> Optional[str]:
+    """
+    Main function to get BPM for a track using all available methods.
     
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
+    Args:
+        artist: Artist name
+        track: Track name
+        
+    Returns:
+        BPM as string if found, None otherwise
+    """
+    # Initialize the database if it doesn't exist
+    init_database()
     
-    # Query the database
-    cursor.execute(
-        "SELECT bpm FROM known_bpms WHERE LOWER(artist) = LOWER(?) AND LOWER(track) = LOWER(?)",
-        (artist.lower(), track.lower())
-    )
-    result = cursor.fetchone()
-    conn.close()
+    # Check if we already have this BPM in our database
+    known_bpm = check_known_bpms(artist, track)
+    if known_bpm:
+        return known_bpm
     
-    if result:
-        bpm = result[0]
-        debug_print(f"Found BPM in known BPMs database: {bpm}")
+    # Try getting BPM from Tunebat API first (usually most reliable)
+    bpm = get_bpm_from_tunebat_api(artist, track)
+    if bpm:
         return bpm
+    
+    # Try getting BPM from Song BPM website
+    bpm = get_bpm_from_songbpm(artist, track)
+    if bpm:
+        return bpm
+    
+    logger.info(f"Could not find BPM for {artist} - {track}")
     return None
-
-def save_bpm_to_db(artist, track, bpm, source):
-    """Save a found BPM to the database"""
-    init_database()  # Make sure database exists
-    
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    
-    try:
-        # Check if entry already exists
-        cursor.execute(
-            "SELECT id FROM known_bpms WHERE LOWER(artist) = LOWER(?) AND LOWER(track) = LOWER(?)",
-            (artist.lower(), track.lower())
-        )
-        existing = cursor.fetchone()
-        
-        current_time = int(time.time())
-        
-        if existing:
-            # Update existing entry
-            cursor.execute(
-                "UPDATE known_bpms SET bpm = ?, source = ?, timestamp = ? WHERE id = ?",
-                (bpm, source, current_time, existing[0])
-            )
-            debug_print(f"Updated BPM in database for {artist} - {track}: {bpm}")
-        else:
-            # Insert new entry
-            cursor.execute(
-                "INSERT INTO known_bpms (artist, track, bpm, source, timestamp) VALUES (?, ?, ?, ?, ?)",
-                (artist.lower(), track.lower(), bpm, source, current_time)
-            )
-            debug_print(f"Added new BPM to database for {artist} - {track}: {bpm}")
-        
-        conn.commit()
-    except sqlite3.Error as e:
-        debug_print(f"Database error: {e}")
-    finally:
-        conn.close()
 
 def main():
+    """Command-line interface for BPM lookup"""
     if len(sys.argv) < 3:
-        print(f"Usage: {sys.argv[0]} <artist> <track>")
+        print("Usage: python bpm_web_lookup.py <artist> <track>", file=sys.stderr)
         sys.exit(1)
     
+    # Extract artist and track from command-line arguments
     artist = sys.argv[1]
     track = sys.argv[2]
     
-    print(f"Looking up BPM for: {artist} - {track}")
+    # Set debug mode if requested
+    global DEBUG
+    if len(sys.argv) > 3 and sys.argv[3].lower() in ['--debug', '-d']:
+        DEBUG = True
+        logger.setLevel(logging.DEBUG)
+        logger.debug("Debug mode enabled")
     
-    # First check if we already have this BPM in our database
-    bpm = check_known_bpms(artist, track)
-    
-    # If not in database, try to get BPM from Tunebat API
-    if not bpm:
-        bpm = get_bpm_from_tunebat(artist, track)
-    
-    # If Tunebat fails, try Song BPM
-    if not bpm:
-        bpm = get_bpm_from_songbpm(artist, track)
+    bpm = get_track_bpm(artist, track)
     
     if bpm:
-        print(f"BPM for '{artist} - {track}': {bpm}")
+        # Print only the BPM value with no extra characters
+        sys.stdout.write(bpm.strip())
+        sys.stdout.flush()
+        sys.exit(0)
     else:
-        print(f"Could not find BPM for '{artist} - {track}'")
+        sys.stderr.write("BPM not found")
+        sys.stderr.flush()
         sys.exit(1)
 
 if __name__ == "__main__":

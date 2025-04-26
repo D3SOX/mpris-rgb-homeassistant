@@ -1,3 +1,26 @@
+# Environment variables
 .env
+
+# Dependencies
 node_modules
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+
+# Database files
 *.sqlite
+*.sqlite3
+*.db
+
+# Logs
+*.log
+logs/
+
+# Runtime data
+tmp/
+.tmp/
+
+# Cache files
+.cache/
