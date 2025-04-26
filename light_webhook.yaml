@@ -6,7 +6,7 @@ triggers:
       - POST
       - PUT
     local_only: false
-    webhook_id: "-RHiEnAQACn2SPnzyNh81btE9"
+    webhook_id: ""
 conditions:
   - condition: state
     entity_id: input_boolean.sync_bulb_right_wall
