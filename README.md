@@ -1,12 +1,56 @@
-# MPRIS RGB Home Assistant
+# MPRIS RGB HomeAssistant Integration
 
-A service that connects your media players to Home Assistant RGB devices. This utility uses the MPRIS interface to detect media playback status and syncs it with your Home Assistant-controlled RGB lights.
+This script connects your media players to Home Assistant for RGB lighting control based on album artwork.
+
+## Features
+
+- Extracts vibrant colors from album artwork
+- Dynamically alternates colors based on track BPM (beats per minute)
+- Works with Spotify and other MPRIS-compatible media players
+- Supports local music files
+- Web-based BPM lookup for tracks
+
+The script will attempt to get BPM information in the following order:
+1. Web-based BPM lookup services
+2. For local files: direct extraction from MP3 metadata
+3. Estimation based on genre detection from track titles
+
+## Usage
+
+Run the script:
+
+```bash
+./mpris_rgb_homeassistant.sh
+```
+
+For automatic startup, add it to your login scripts or create a systemd service.
+
+## Configuration Options
+
+Edit the script to adjust these variables:
+
+- `POLL_INTERVAL`: How often to check for playing media (seconds)
+- `ALTERNATION_DELAY`: Default delay between color alternations (used when BPM is unavailable)
+- `NUM_COLORS`: Number of colors to extract from artwork
+- `MIN_BPM_DELAY`: Minimum delay for fast-tempo tracks 
+- `MAX_BPM_DELAY`: Maximum delay for slow-tempo tracks
+- `USE_BPM`: Set to false to disable BPM detection
+
+## Requirements
+
+
 
 ## Prerequisites
 
-- Linux system with systemd
+- Linux system with
+  - systemd
+  - playerctl
+  - ImageMagick
+  - curl
+  - bc (basic calculator)
+  - Bash
+  - Media players that support MPRIS
 - Home Assistant setup with RGB devices
-- Media players that support MPRIS
 
 ## Installation
 
@@ -60,7 +104,7 @@ To receive and process RGB data from this script, you need to create a webhook i
 
 ```yaml
 alias: Light Webhook
-description: Update Light Webhook
+description: Update Light Webhook for multiple colors with dynamic transition time
 triggers:
   - trigger: webhook
     allowed_methods:
@@ -73,19 +117,25 @@ conditions:
     entity_id: input_boolean.sync_bulb_right_wall
     state: "on"
 actions:
-  - action: yeelight.set_music_mode
-    metadata: {}
-    data:
-      music_mode: true
-    target:
-      entity_id: light.your_rgb_light  # Replace with your light entity
-  - action: light.turn_on
-    metadata: {}
-    data:
-      transition: 1
-      rgb_color: "{{trigger.json.rgb}}"
-    target:
-      entity_id: light.your_rgb_light  # Replace with your light entity
+  - parallel:
+      - action: light.turn_on
+        metadata: {}
+        data:
+          transition: "{{ trigger.json.transition | default(1) }}"
+          rgb_color: "{{ trigger.json.rgb }}"
+        target:
+          entity_id: light.your_rgb_light  # Replace with your light entity
+      - if:
+          - condition: template
+            value_template: "{{ state_attr('light.your_rgb_light','music_mode') == True }}"
+        then:
+          - action: yeelight.set_music_mode
+            metadata: {}
+            data:
+              music_mode: false
+            target:
+              entity_id: light.your_rgb_light  # Replace with your light entity
+        else: []
 mode: single
 ```
 
@@ -118,11 +168,12 @@ COLOR_INDEX=0  # Track which color to use (don't change this)
 
 ### Yeelight Music Mode
 
-If using Yeelight bulbs, enabling Music Mode provides smoother transitions. The example Home Assistant automation above includes the necessary action to enable music mode before applying color changes.
+For Yeelight bulbs, the webhook is configured to disable music mode when it's active, as this can provide more reliable control in some environments. If you want to use music mode instead:
 
-For even smoother color transitions with Yeelight bulbs:
-1. Enable the extra `yeelight.set_music_mode` action in your Home Assistant webhook automation
-2. Adjust the transition time based on your preferences
+1. Modify the webhook configuration to set `music_mode: true` instead of `false`
+2. Adjust the condition template as needed for your setup
+
+The script sends dynamic transition times based on the BPM of the current track, creating smoother, rhythm-matched color transitions.
 
 ### Excluding Media Players
 
@@ -150,10 +201,17 @@ https://home.example.org/api/webhook/unique_webhook_id
 To change your RGB light colors remotely, send a POST request to the webhook URL:
 
 ```bash
+# Basic color change
 curl -X POST \
   https://home.example.org/api/webhook/unique_webhook_id \
   -H 'Content-Type: application/json' \
   -d '{"rgb": [255, 0, 0]}'
+
+# With custom transition time (2.5 seconds)
+curl -X POST \
+  https://home.example.org/api/webhook/unique_webhook_id \
+  -H 'Content-Type: application/json' \
+  -d '{"rgb": [255, 0, 0], "transition": 2.5}'
 ```
 
 Python example:
@@ -161,7 +219,10 @@ Python example:
 import requests
 
 url = "https://home.example.org/api/webhook/unique_webhook_id"
-payload = {"rgb": [255, 0, 0]}  # Red color
+payload = {
+    "rgb": [255, 0, 0],  # Red color
+    "transition": 2.0  # 2 second transition
+}
 
 response = requests.post(url, json=payload)
 print(response.status_code)

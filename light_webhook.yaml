@@ -1,0 +1,35 @@
+alias: Light Webhook
+description: Update Light Webhook for multiple colors with dynamic transition time
+triggers:
+  - trigger: webhook
+    allowed_methods:
+      - POST
+      - PUT
+    local_only: false
+    webhook_id: "-RHiEnAQACn2SPnzyNh81btE9"
+conditions:
+  - condition: state
+    entity_id: input_boolean.sync_bulb_right_wall
+    state: "on"
+actions:
+  - parallel:
+      - action: light.turn_on
+        metadata: {}
+        data:
+          # Use the transition time from the JSON payload or default to 1 second
+          transition: "{{ trigger.json.transition | default(1) }}"
+          rgb_color: "{{ trigger.json.rgb }}"
+        target:
+          entity_id: light.bulb_right_wall
+      - if:
+          - condition: template
+            value_template: "{{ state_attr('light.bulb_right_wall','music_mode') == True }}"
+        then:
+          - action: yeelight.set_music_mode
+            metadata: {}
+            data:
+              music_mode: false
+            target:
+              entity_id: light.bulb_right_wall
+        else: []
+mode: single 
