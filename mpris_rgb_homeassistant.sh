@@ -1805,7 +1805,7 @@ while true; do
     if $ACTIVE_SOURCE_PLAYER_PLAYING; then
       log_message "Source player '$COLORS_SOURCE_PLAYER' is playing - resuming color rotation (matched with '$ACTIVE_PLAYER')"
     elif [[ -n "$COLORS_SOURCE_PLAYER" && "$AUTO_SWITCH_PLAYERS" = "true" && -n "$ACTIVE_PLAYER" && "$IS_IGNORED_PLAYER" = "false" ]]; then
-      log_message "Different player '$ACTIVE_PLAYER' is playing - automatically switching to new player"
+      log_message "New player '$ACTIVE_PLAYER' started. Switching artwork source."
       # We'll let the normal processing handle the player switch
       # This ensures we get its artwork and process it correctly
     elif [[ -n "$COLORS_SOURCE_PLAYER" ]]; then
@@ -1838,17 +1838,17 @@ while true; do
     # Only reset source player and switch if this is not an ignored player
     if [ "$IS_IGNORED_PLAYER" = "false" ]; then
       # If auto-switching is enabled and there's a different active player,
-      # we'll reset the source player and process the new active player's artwork in the next cycle
+      # we'll reset the source player. The main loop will pick up the new player's
+      # artwork in the next cycle and call process_artwork, which stops the old alternation.
+      if [[ "$PLAYER_STATE_CHANGED" = true ]]; then
+         log_message "Detected new active player '$ACTIVE_PLAYER'. Clearing source to initiate switch."
+      fi
       COLORS_SOURCE_PLAYER=""
       # Remove the file to ensure consistency
       rm -f "/tmp/mpris_rgb_source_player" 2>/dev/null
     fi
-
-    # Only log when state changes
-    if [[ "$PLAYER_STATE_CHANGED" = true ]]; then
-      log_message "Pausing color alternation (wrong player active)"
-    fi
-    pause_background_alternation
+    # No need to explicitly pause here, clearing the source player triggers the switch mechanism.
+    # The main loop will handle processing the new player's artwork.
   fi
   
   # First pass - check if Spotify is playing and has artwork
